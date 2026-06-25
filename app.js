@@ -1084,14 +1084,32 @@ function openQuestionModal(questionId = null) {
   updateAnswerOptionsVisibility();
 }
 
-function openRuleModal(ruleId = null) {
+function comparisonValueOptions(question, selectedValue = "") {
+  const values = question?.options?.length ? question.options : defaultOptionsForType(question?.type);
+  if (!values.length) return `<option value="">-- Câu hỏi này chưa có danh sách giá trị --</option>`;
+  return `
+    <option value="">-- Chọn giá trị --</option>
+    ${values.map((value) => `<option value="${escapeHtml(value)}" ${value === selectedValue ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+  `;
+}
+
+function updateRuleValueOptions(selectedValue = "") {
+  const form = document.querySelector("#ruleForm");
+  if (!form) return;
+  const sourceCode = form.elements.source.value;
+  const sourceQuestion = selectedQuestions().find((question) => question.code === sourceCode);
+  const valueSelect = form.querySelector("#ruleValue");
+  valueSelect.innerHTML = comparisonValueOptions(sourceQuestion, selectedValue);
+}
+
+function openRuleModal(ruleId = null, sourceQuestionId = null) {
   const surveyQs = selectedQuestions();
   const editingRule = ruleId ? rules.find((rule) => rule.id === ruleId) : null;
+  const preselectedQuestion = sourceQuestionId ? surveyQs.find((question) => question.id === sourceQuestionId) : null;
   const isEditing = Boolean(editingRule);
   const nextOrder = selectedRules().length + 1;
-  const questionOptions = surveyQs.length
-    ? surveyQs.map((question) => `<option value="${question.code}">${question.code} - ${escapeHtml(question.text)}</option>`).join("")
-    : `<option value="">-- Chọn câu hỏi --</option>`;
+  const selectedSourceCode = editingRule?.source || preselectedQuestion?.code || surveyQs[0]?.code || "";
+  const selectedSourceQuestion = surveyQs.find((question) => question.code === selectedSourceCode);
   const optionList = (selectedCode = "") =>
     surveyQs.length
       ? surveyQs.map((question) => `<option value="${question.code}" ${question.code === selectedCode ? "selected" : ""}>${question.code} - ${escapeHtml(question.text)}</option>`).join("")
@@ -1125,8 +1143,7 @@ function openRuleModal(ruleId = null) {
             <div class="field full">
               <label for="ruleSource">Câu hỏi nguồn <span class="required">*</span></label>
               <select class="select" id="ruleSource" name="source" required>
-                <option value="">-- Chọn câu hỏi --</option>
-                ${optionList(editingRule?.source)}
+                ${optionList(selectedSourceCode)}
               </select>
             </div>
             <div class="field">
@@ -1137,7 +1154,9 @@ function openRuleModal(ruleId = null) {
             </div>
             <div class="field">
               <label for="ruleValue">Giá trị so sánh</label>
-              <input class="input" id="ruleValue" name="value" value="${escapeHtml(editingRule?.value || "")}" placeholder="Nhập giá trị" />
+              <select class="select" id="ruleValue" name="value" required>
+                ${comparisonValueOptions(selectedSourceQuestion, editingRule?.value || "")}
+              </select>
             </div>
           </div>
         </section>
@@ -1199,6 +1218,8 @@ function openRuleModal(ruleId = null) {
     showToast(isEditing ? "Đã cập nhật điều kiện rẽ nhánh." : "Đã thêm điều kiện rẽ nhánh.");
     render();
   });
+
+  document.querySelector("#ruleSource").addEventListener("change", () => updateRuleValueOptions());
 }
 
 function openModal(html) {
@@ -1353,7 +1374,7 @@ document.addEventListener("click", (event) => {
     if (row && list && list.querySelectorAll(".answer-option-row").length > 1) row.remove();
     else showToast("Cần giữ lại ít nhất một đáp án.");
   }
-  if (action === "add-rule") openRuleModal();
+  if (action === "add-rule") openRuleModal(null, actionTarget.dataset.id);
   if (action === "view-rule") {
     const rule = rules.find((item) => item.id === actionTarget.dataset.id);
     if (rule) showToast(`${rule.code}: nếu ${rule.source} ${rule.operator} ${rule.value} thì ${rule.action} ${rule.target}`);
@@ -1379,7 +1400,7 @@ document.addEventListener("click", (event) => {
     showToast("Prototype: chưa phát hiện vòng lặp trong điều kiện hiện tại.");
   }
   if (action === "close-modal") closeModal();
-  if (action === "backdrop" && event.target === actionTarget) closeModal();
+  if (action === "backdrop" && event.target === actionTarget) return;
   if (action === "detail-tab") {
     state.detailTab = actionTarget.dataset.tab;
     if (state.detailTab === "entry") state.selectedQuestionIndex = 0;
