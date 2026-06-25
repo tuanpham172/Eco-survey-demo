@@ -3,6 +3,7 @@ const state = {
   selectedSurveyId: null,
   detailTab: "questions",
   selectedQuestionIndex: 0,
+  entryHistory: [],
   search: "",
   statusFilter: "all",
   answers: {},
@@ -95,11 +96,51 @@ const content = document.querySelector("#content");
 const modalRoot = document.querySelector("#modalRoot");
 const toast = document.querySelector("#toast");
 let pendingConfirm = null;
+const STORAGE_KEY = "ecosurvey-portal-prototype-v1";
+
+function replaceArray(target, value) {
+  target.splice(0, target.length, ...(Array.isArray(value) ? value : []));
+}
+
+function loadPrototypeData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    replaceArray(surveys, data.surveys);
+    replaceArray(questions, data.questions);
+    replaceArray(rules, data.rules);
+    replaceArray(sessions, data.sessions);
+    state.answers = data.answers && typeof data.answers === "object" ? data.answers : {};
+    state.selectedSurveyId = surveys.some((survey) => survey.id === data.selectedSurveyId) ? data.selectedSurveyId : surveys[0]?.id || null;
+  } catch (error) {
+    console.warn("Không thể nạp dữ liệu prototype đã lưu.", error);
+  }
+}
+
+function persistPrototypeData() {
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        surveys,
+        questions,
+        rules,
+        sessions,
+        answers: state.answers,
+        selectedSurveyId: state.selectedSurveyId,
+      }),
+    );
+  } catch (error) {
+    console.warn("Không thể lưu dữ liệu prototype.", error);
+  }
+}
 
 surveys.splice(0);
 questions.splice(0);
 rules.splice(0);
 sessions.splice(0);
+loadPrototypeData();
 
 function q(id, surveyId, code, order, type, text, required = false, options = []) {
   return {
@@ -136,6 +177,60 @@ function selectedRules() {
   return rules
     .filter((rule) => rule.surveyId === survey.id)
     .sort((a, b) => a.priority - b.priority);
+}
+
+function normalizedText(value) {
+  return String(value ?? "")
+    .trim()
+    .toLocaleLowerCase("vi-VN")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d");
+}
+
+function answerMatchesRule(answer, rule) {
+  if (Array.isArray(answer)) {
+    return answer.some((item) => answerMatchesRule(item, rule));
+  }
+  const left = String(answer ?? "").trim();
+  const right = String(rule.value ?? "").trim();
+  const operator = normalizedText(rule.operator);
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  const hasNumbers = !Number.isNaN(leftNumber) && !Number.isNaN(rightNumber);
+
+  if (operator.includes("khac")) return left !== right;
+  if (operator.includes("lon hon")) return hasNumbers ? leftNumber > rightNumber : left > right;
+  if (operator.includes("nho hon hoac bang")) return hasNumbers ? leftNumber <= rightNumber : left <= right;
+  if (operator.includes("nho hon")) return hasNumbers ? leftNumber < rightNumber : left < right;
+  if (operator.includes("co chua")) return normalizedText(left).includes(normalizedText(right));
+  return left === right;
+}
+
+function matchedRuleForQuestion(question) {
+  if (!question) return null;
+  const answer = state.answers[question.code];
+  if (answer === undefined || answer === "" || (Array.isArray(answer) && !answer.length)) return null;
+  return selectedRules().find((rule) => rule.active && rule.source === question.code && answerMatchesRule(answer, rule)) || null;
+}
+
+function questionIndexByCode(code, surveyQs = selectedQuestions()) {
+  return surveyQs.findIndex((question) => question.code === code);
+}
+
+function nextEntryQuestionIndex() {
+  const surveyQs = selectedQuestions();
+  const current = surveyQs[state.selectedQuestionIndex] || surveyQs[0];
+  const matchedRule = matchedRuleForQuestion(current);
+  const targetIndex = matchedRule ? questionIndexByCode(matchedRule.target, surveyQs) : -1;
+  if (targetIndex >= 0 && ["Hiển thị câu hỏi", "Bỏ qua câu hỏi"].includes(matchedRule.action)) return targetIndex;
+  return Math.min(state.selectedQuestionIndex + 1, Math.max(surveyQs.length - 1, 0));
+}
+
+function goToEntryQuestion(nextIndex) {
+  if (nextIndex === state.selectedQuestionIndex) return;
+  state.entryHistory.push(state.selectedQuestionIndex);
+  state.selectedQuestionIndex = nextIndex;
 }
 
 function escapeHtml(value) {
@@ -234,6 +329,7 @@ function renderHeader(title, subtitle, action = "") {
 }
 
 function render() {
+  persistPrototypeData();
   syncNav();
   const view = state.view;
   if (view === "dashboard") renderDashboard();
@@ -901,6 +997,7 @@ function renderEntry() {
   document.querySelector("#entrySurvey").addEventListener("change", (event) => {
     state.selectedSurveyId = event.target.value;
     state.selectedQuestionIndex = 0;
+    state.entryHistory = [];
     renderEntry();
   });
 }
@@ -1263,7 +1360,10 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
     state.view = button.dataset.view;
     state.search = "";
-    if (state.view === "entry") state.selectedQuestionIndex = 0;
+    if (state.view === "entry") {
+      state.selectedQuestionIndex = 0;
+      state.entryHistory = [];
+    }
     render();
   });
 });
@@ -1413,20 +1513,22 @@ document.addEventListener("click", (event) => {
   if (action === "goto-entry") {
     state.detailTab = "entry";
     state.selectedQuestionIndex = 0;
+    state.entryHistory = [];
     renderSurveyDetail();
   }
   if (action === "select-question") {
     state.selectedQuestionIndex = Number(actionTarget.dataset.index);
+    state.entryHistory = [];
     if (state.view === "surveyDetail") renderSurveyDetail();
     else renderEntry();
   }
   if (action === "next-question") {
-    state.selectedQuestionIndex = Math.min(state.selectedQuestionIndex + 1, Math.max(selectedQuestions().length - 1, 0));
+    goToEntryQuestion(nextEntryQuestionIndex());
     if (state.view === "surveyDetail") renderSurveyDetail();
     else renderEntry();
   }
   if (action === "prev-question") {
-    state.selectedQuestionIndex = Math.max(state.selectedQuestionIndex - 1, 0);
+    state.selectedQuestionIndex = state.entryHistory.length ? state.entryHistory.pop() : Math.max(state.selectedQuestionIndex - 1, 0);
     if (state.view === "surveyDetail") renderSurveyDetail();
     else renderEntry();
   }
@@ -1435,7 +1537,10 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("change", (event) => {
   const answerCode = event.target.dataset.answer;
-  if (answerCode) state.answers[answerCode] = event.target.value;
+  if (answerCode) {
+    state.answers[answerCode] = event.target.value;
+    persistPrototypeData();
+  }
 
   const multiCode = event.target.dataset.multiAnswer;
   if (multiCode) {
@@ -1443,12 +1548,16 @@ document.addEventListener("change", (event) => {
     if (event.target.checked) values.add(event.target.value);
     else values.delete(event.target.value);
     state.answers[multiCode] = [...values];
+    persistPrototypeData();
   }
 });
 
 document.addEventListener("input", (event) => {
   const answerCode = event.target.dataset.answerText;
-  if (answerCode) state.answers[answerCode] = event.target.value;
+  if (answerCode) {
+    state.answers[answerCode] = event.target.value;
+    persistPrototypeData();
+  }
 });
 
 document.addEventListener("keydown", (event) => {
