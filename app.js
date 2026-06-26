@@ -6,10 +6,13 @@ const state = {
   selectedQuestionIndex: 0,
   entryHistory: [],
   search: "",
+  searchDraft: "",
   statusFilter: "all",
   customerSearch: "",
+  customerSearchDraft: "",
   reportSurveyFilter: "all",
   reportCustomerFilter: "",
+  reportCustomerDraft: "",
   reportFrom: "",
   reportTo: "",
   currentRole: "SYSTEM_ADMIN",
@@ -153,6 +156,7 @@ const toast = document.querySelector("#toast");
 let pendingConfirm = null;
 let draggedQuestionId = null;
 const STORAGE_KEY = "ecosurvey-portal-prototype-v1";
+const END_SURVEY_TARGET = "__END_SURVEY__";
 
 function replaceArray(target, value) {
   target.splice(0, target.length, ...(Array.isArray(value) ? value : []));
@@ -269,7 +273,8 @@ function activeStatusLabel(isActive) {
 }
 
 function activeSurveys() {
-  return surveys.filter((survey) => isSurveyActive(survey));
+  syncExpiredSurveys();
+  return surveys.filter((survey) => !isSurveyExpiredStatus(survey.status) && !isSurveyEndedStatus(survey.status) && (survey.active === true || isSurveyStatusActive(survey.status)));
 }
 
 function permissionsForRole(roleCode) {
@@ -291,7 +296,46 @@ function hasPermission(permissionCode, user = null) {
 
 function isSurveyStatusActive(status) {
   const key = normalizedText(status);
-  return key === "hoat dong" || key === "dang hoat dong";
+  if (!key) return false;
+  if (key.includes("khong") || key.includes("ngung") || key.includes("tam dung") || key.includes("luu nhap") || key.includes("khoi tao")) return false;
+  return ["hoat dong", "dang hoat dong", "active", "published", "da phat hanh", "phat hanh"].includes(key);
+}
+
+function isSurveyEndedStatus(status) {
+  return normalizedText(status) === "ket thuc";
+}
+
+function isSurveyExpiredStatus(status) {
+  return normalizedText(status) === "het han";
+}
+
+function isSurveyPausedStatus(status) {
+  return normalizedText(status).includes("ngung");
+}
+
+function isSurveyDraftStatus(status) {
+  const key = normalizedText(status);
+  return key === "khoi tao" || key === "cho duyet";
+}
+
+function isPastSurveyEndDate(survey) {
+  if (!survey?.endDate) return false;
+  const end = new Date(survey.endDate);
+  end.setHours(23, 59, 59, 999);
+  return !Number.isNaN(end.getTime()) && end < new Date();
+}
+
+function syncExpiredSurveys() {
+  let changed = false;
+  surveys.forEach((survey) => {
+    if (!isSurveyEndedStatus(survey.status) && isPastSurveyEndDate(survey) && !isSurveyExpiredStatus(survey.status)) {
+      survey.status = "Hết hạn";
+      survey.updatedBy = survey.updatedBy || "Hệ thống";
+      survey.updatedAt = survey.updatedAt || new Date().toISOString();
+      changed = true;
+    }
+  });
+  if (changed) persistPrototypeData();
 }
 
 function isSurveyActive(survey) {
@@ -351,9 +395,13 @@ function validateSurveyConfig(surveyId) {
   const activeCodes = new Set(surveyQuestions.filter((question) => question.active !== false).map((question) => question.code));
   surveyRules.forEach((rule) => {
     if (!activeCodes.has(rule.source)) errors.push(`${rule.code} tham chiếu câu hỏi nguồn không active/không tồn tại.`);
-    if (rule.action !== "Kết thúc khảo sát" && !rule.target) errors.push(`${rule.code} thiếu câu hỏi đích.`);
-    if (rule.target && !activeCodes.has(rule.target)) errors.push(`${rule.code} tham chiếu câu hỏi đích không active/không tồn tại.`);
-    if (rule.source && rule.target && rule.source === rule.target) errors.push(`${rule.code} không được tự trỏ cùng một câu hỏi.`);
+    ruleGroups(rule).forEach((group, index) => {
+      const groupLabel = `${rule.code} / Nhóm ${index + 1}`;
+      if (!group.value?.toString().trim()) errors.push(`${groupLabel} thiếu giá trị so sánh.`);
+      if (group.action !== "Kết thúc khảo sát" && !group.target) errors.push(`${groupLabel} thiếu câu hỏi đích.`);
+      if (group.target && !activeCodes.has(group.target)) errors.push(`${groupLabel} tham chiếu câu hỏi đích không active/không tồn tại.`);
+      if (rule.source && group.target && rule.source === group.target) errors.push(`${groupLabel} không được tự trỏ cùng một câu hỏi.`);
+    });
   });
   return errors;
 }
@@ -391,6 +439,38 @@ function selectedRules() {
   return rules
     .filter((rule) => rule.surveyId === survey.id)
     .sort((a, b) => a.priority - b.priority);
+}
+
+function ruleGroups(rule) {
+  const groups = Array.isArray(rule?.groups) ? rule.groups : [];
+  if (groups.length) {
+    return groups.map((group, index) => ({
+      id: group.id || `group-${index + 1}`,
+      operator: group.operator || rule.operator || "Bằng (=)",
+      matrixRow: group.matrixRow || "",
+      value: group.value ?? "",
+      action: group.action || rule.action || "Hiển thị câu hỏi",
+      target: group.target || "",
+    }));
+  }
+  return [
+    {
+      id: "group-1",
+      operator: rule?.operator || "Bằng (=)",
+      matrixRow: rule?.matrixRow || "",
+      value: rule?.value ?? "",
+      action: rule?.action || "Hiển thị câu hỏi",
+      target: rule?.target || "",
+    },
+  ];
+}
+
+function primaryRuleGroup(rule) {
+  return ruleGroups(rule)[0] || {};
+}
+
+function describeRuleGroup(group) {
+  return `${group.operator || "Bằng (=)"} ${group.value || "—"} → ${group.action || "Hiển thị câu hỏi"} ${group.target || "—"}`;
 }
 
 function displayUserName(username) {
@@ -439,14 +519,16 @@ function matchedRuleForQuestion(question) {
   if (!question) return null;
   const answer = state.answers[question.code];
   if (answer === undefined || answer === "" || (Array.isArray(answer) && !answer.length)) return null;
-  return (
-    selectedRules().find((rule) => {
-      if (!rule.active || rule.source !== question.code) return false;
-      const comparableAnswer = isMatrixQuestionType(question.type) ? answer?.[rule.matrixRow] : answer;
-      if (comparableAnswer === undefined || comparableAnswer === "" || (Array.isArray(comparableAnswer) && !comparableAnswer.length)) return false;
-      return answerMatchesRule(comparableAnswer, rule);
-    }) || null
-  );
+  const matches = [];
+  for (const rule of selectedRules()) {
+    if (!rule.active || rule.source !== question.code) continue;
+    for (const group of ruleGroups(rule)) {
+      const comparableAnswer = isMatrixQuestionType(question.type) ? answer?.[group.matrixRow] : answer;
+      if (comparableAnswer === undefined || comparableAnswer === "" || (Array.isArray(comparableAnswer) && !comparableAnswer.length)) continue;
+      if (answerMatchesRule(comparableAnswer, group)) matches.push({ ...rule, ...group, matchedGroup: group, parentRule: rule });
+    }
+  }
+  return matches.find((match) => match.action === "Kết thúc khảo sát") || matches[0] || null;
 }
 
 function questionIndexByCode(code, surveyQs = selectedQuestions()) {
@@ -492,6 +574,7 @@ function icon(name) {
     clock: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="2"/><path d="M12 8v5l3 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     check: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="2"/><path d="m8.5 12.5 2.2 2.2 4.8-5.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     user: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="2"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    search: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="6" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     save: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 4h12l2 2v14H5V4Z" stroke="currentColor" stroke-width="2"/><path d="M8 4v6h8V4M8 20v-6h8v6" stroke="currentColor" stroke-width="2"/></svg>',
     plus: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>',
     arrowLeft: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M15 6 9 12l6 6M10 12h10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -581,6 +664,21 @@ function upsertReport(report) {
   const existingIndex = reports.findIndex((item) => item.sessionId === report.sessionId);
   if (existingIndex >= 0) reports.splice(existingIndex, 1, report);
   else reports.unshift(report);
+}
+
+function finishSurveySession(session, customer, survey) {
+  if (!session || !customer || !survey) return false;
+  session.status = "Hoàn thành";
+  session.completedAt = new Date().toISOString();
+  upsertReport(buildSurveyResult(session, customer, survey));
+  state.view = "reports";
+  state.detailTab = "questions";
+  state.selectedQuestionIndex = 0;
+  state.entryHistory = [];
+  state.reportSurveyFilter = survey.id;
+  state.reportCustomerFilter = "";
+  persistPrototypeData();
+  return true;
 }
 
 function resetDraftAnswersForSurvey(surveyId) {
@@ -887,11 +985,33 @@ function renderDashboard() {
   `;
 }
 
+function renderSurveyActions(survey) {
+  const active = isSurveyStatusActive(survey.status);
+  const paused = isSurveyPausedStatus(survey.status);
+  const ended = isSurveyEndedStatus(survey.status);
+  const expired = isSurveyExpiredStatus(survey.status);
+  const canApprove = !active && !paused && !ended && !expired;
+  const canToggleActive = active || paused;
+  return `
+    ${actionButton("open-survey", survey.id, "eye", "Xem khảo sát")}
+    ${!ended ? actionButton("edit-survey", survey.id, "edit", "Sửa khảo sát") : ""}
+    ${canApprove ? actionButton("publish-survey", survey.id, "trend", "Duyệt khảo sát") : ""}
+    ${canToggleActive ? actionButton("archive-survey", survey.id, active ? "clock" : "trend", active ? "Ngưng hoạt động" : "Hoạt động trở lại") : ""}
+    ${!ended ? actionButton("finish-survey", survey.id, "check", "Kết thúc khảo sát") : ""}
+    ${
+      active
+        ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Không thể xóa khảo sát đang hoạt động" title="Không thể xóa khảo sát đang hoạt động">${icon("trash")}</button>`
+        : actionButton("delete-survey", survey.id, "trash", "Xóa khảo sát", "danger")
+    }
+  `;
+}
+
 function renderSurveys() {
+  syncExpiredSurveys();
   const filtered = surveys.filter((survey) => {
-    const value = `${survey.name} ${survey.code} ${survey.department}`.toLowerCase();
-    const statusMatched = state.statusFilter === "all" || survey.status === state.statusFilter;
-    return value.includes(state.search.toLowerCase()) && statusMatched;
+    const value = normalizedText(`${survey.name} ${survey.code} ${survey.department} ${survey.channel}`);
+    const statusMatched = state.statusFilter === "all" || normalizedText(survey.status) === normalizedText(state.statusFilter);
+    return (!state.search || value.includes(normalizedText(state.search))) && statusMatched;
   });
   const statuses = ["all", ...SURVEY_STATUSES.filter((status) => surveys.some((survey) => survey.status === status))];
 
@@ -901,16 +1021,17 @@ function renderSurveys() {
       "Tạo, cập nhật và theo dõi phiên bản khảo sát.",
       `<button class="btn primary" data-action="create-survey" type="button">${icon("plus")} Tạo khảo sát mới</button>`,
     )}
-    <div class="toolbar">
+    <form class="toolbar" id="surveySearchForm">
       <div class="toolbar-left">
-        <input class="search" id="surveySearch" value="${escapeHtml(state.search)}" placeholder="Tìm theo tên, mã, phòng ban..." />
+        <input class="search" id="surveySearch" value="${escapeHtml(state.searchDraft || state.search)}" placeholder="Tìm theo tên, mã, phòng ban..." autocomplete="off" />
+        <button class="btn secondary" type="submit">${icon("search")} Tìm kiếm</button>
       </div>
       <select class="select compact-select" id="statusFilter" aria-label="Lọc trạng thái khảo sát">
         ${statuses
           .map((status) => `<option value="${status}" ${status === state.statusFilter ? "selected" : ""}>${status === "all" ? "Tất cả trạng thái" : escapeHtml(status)}</option>`)
           .join("")}
       </select>
-    </div>
+    </form>
     <section class="panel table-panel">
       <div class="panel-header">
         <h2 class="panel-title">Danh sách khảo sát</h2>
@@ -920,7 +1041,13 @@ function renderSurveys() {
         <span>Mã / Tên khảo sát</span>
         <span>Phiên bản</span>
         <span>Kênh</span>
+        <span>Bắt đầu</span>
+        <span>Kết thúc</span>
         <span>Trạng thái</span>
+        <span>Người tạo</span>
+        <span>Ngày tạo</span>
+        <span>Người cập nhật</span>
+        <span>Ngày cập nhật</span>
         <span>Thao tác</span>
       </div>
       ${
@@ -934,19 +1061,16 @@ function renderSurveys() {
                     <span class="item-meta">${escapeHtml(survey.code || "—")}</span>
                   </button>
                   <span class="table-cell">v${survey.version}</span>
-                  <span class="table-cell">${escapeHtml(survey.channel.replace(" nhập liệu", ""))}</span>
-                  <div class="status-toggle-cell">
-                    <button class="switch ${isSurveyStatusActive(survey.status) ? "on" : ""}" type="button" data-action="toggle-survey-active" data-id="${survey.id}" aria-label="${isSurveyStatusActive(survey.status) ? "Tắt khảo sát" : "Bật khảo sát"}"><span></span></button>
-                    <span class="item-meta">${escapeHtml(activeStatusLabel(isSurveyStatusActive(survey.status)))}</span>
-                  </div>
+                  <span class="table-cell">${escapeHtml(survey.channel || "—")}</span>
+                  <span class="table-cell">${escapeHtml(formatDate(survey.startDate))}</span>
+                  <span class="table-cell">${escapeHtml(formatDate(survey.endDate))}</span>
+                  <span>${badge(survey.status || activeStatusLabel(isSurveyStatusActive(survey.status)), isSurveyStatusActive(survey.status))}</span>
+                  <span class="table-cell">${escapeHtml(displayUserName(survey.createdBy))}</span>
+                  <span class="table-cell">${escapeHtml(displayDateTime(survey.createdAt))}</span>
+                  <span class="table-cell">${escapeHtml(displayUserName(survey.updatedBy))}</span>
+                  <span class="table-cell">${escapeHtml(displayDateTime(survey.updatedAt))}</span>
                   <div class="row-actions">
-                    ${actionButton("open-survey", survey.id, "eye", "Xem khảo sát")}
-                    ${actionButton("validate-survey", survey.id, "check", "Validate khảo sát")}
-                    ${actionButton("publish-survey", survey.id, "trend", "Publish khảo sát")}
-                    ${actionButton("archive-survey", survey.id, "clock", "Ngưng hoạt động")}
-                    ${actionButton("edit-survey", survey.id, "edit", "Sửa khảo sát")}
-                    ${actionButton("duplicate-survey", survey.id, "copy", "Nhân bản khảo sát")}
-                    ${actionButton("delete-survey", survey.id, "trash", "Xóa khảo sát", "danger")}
+                    ${renderSurveyActions(survey)}
                   </div>
                 </div>
               `,
@@ -957,8 +1081,13 @@ function renderSurveys() {
     </section>
   `;
 
-  document.querySelector("#surveySearch").addEventListener("input", (event) => {
-    state.search = event.target.value;
+  document.querySelector("#surveySearch")?.addEventListener("input", (event) => {
+    state.searchDraft = event.target.value;
+  });
+  document.querySelector("#surveySearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.search = document.querySelector("#surveySearch")?.value || "";
+    state.searchDraft = state.search;
     renderSurveys();
   });
   document.querySelector("#statusFilter").addEventListener("change", (event) => {
@@ -977,14 +1106,17 @@ function renderCustomers() {
     ${renderHeader(
       "Khách hàng",
       "Danh sách khách hàng mẫu để chọn và thực hiện khảo sát.",
-      `<button class="btn secondary" type="button" data-action="reset-customer-context">${icon("check")} Bỏ chọn khách hàng</button>`,
+      "",
     )}
-    <section class="panel customer-filter-panel">
+    <form class="panel customer-filter-panel" id="customerSearchForm">
       <div class="field customer-search-field">
         <label for="customerSearch">Tìm khách hàng</label>
-        <input class="search" id="customerSearch" value="${escapeHtml(state.customerSearch)}" placeholder="Nhập tên, mã KH, SĐT, căn hộ..." autocomplete="off" />
+        <div class="inline-search">
+          <input class="search" id="customerSearch" value="${escapeHtml(state.customerSearchDraft || state.customerSearch)}" placeholder="Nhập tên, mã KH, SĐT, căn hộ..." autocomplete="off" />
+          <button class="btn secondary" type="submit">${icon("search")} Tìm kiếm</button>
+        </div>
       </div>
-    </section>
+    </form>
     <section class="panel table-panel">
       <div class="panel-header">
         <h2 class="panel-title">Danh sách khách hàng</h2>
@@ -1026,7 +1158,12 @@ function renderCustomers() {
   `;
 
   document.querySelector("#customerSearch")?.addEventListener("input", (event) => {
-    state.customerSearch = event.target.value;
+    state.customerSearchDraft = event.target.value;
+  });
+  document.querySelector("#customerSearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.customerSearch = document.querySelector("#customerSearch")?.value || "";
+    state.customerSearchDraft = state.customerSearch;
     renderCustomers();
   });
 }
@@ -1054,8 +1191,8 @@ function renderUsers() {
         <span>Vai trò</span>
         <span>Trạng thái</span>
         <span>Allow list Agent</span>
-        <span>Cấu hình quyền</span>
         <span>Quyền áp dụng</span>
+        <span>Thao tác</span>
       </div>
       ${
         users
@@ -1082,16 +1219,15 @@ function renderUsers() {
                 <button class="switch ${user.allowAgentEntry ? "on" : ""}" type="button" data-action="toggle-user-allowlist" data-id="${user.id}" aria-label="${user.allowAgentEntry ? "Gỡ khỏi allow list" : "Thêm vào allow list"}"><span></span></button>
                 <span class="item-meta">${user.allowAgentEntry ? "Được phép" : "Không"}</span>
               </div>
-              <div class="status-toggle-cell">
-                <button class="switch ${user.allowPermissionConfig ? "on" : ""}" type="button" data-action="toggle-user-permission-config" data-id="${user.id}" aria-label="${user.allowPermissionConfig ? "Tắt quyền cấu hình" : "Bật quyền cấu hình"}"><span></span></button>
-                <span class="item-meta">${user.allowPermissionConfig ? "Được phép" : "Không"}</span>
-              </div>
-              <div class="table-cell">
-                <span>${escapeHtml(permissionSummary(user))}</span>
+              <span class="table-cell">${escapeHtml(permissionSummary(user))}</span>
+              <div class="row-actions user-row-actions">
                 ${
                   user.roleCode !== "AGENT_VIA_SALESFORCE"
-                    ? `<button class="btn secondary compact-action" type="button" data-action="edit-user-permissions" data-id="${user.id}" style="margin-top: 8px">Gán quyền</button>`
-                    : ""
+                    ? `
+                      <button class="btn secondary compact-action" type="button" data-action="edit-user-permissions" data-id="${user.id}">Gán quyền</button>
+                      <button class="btn secondary compact-action" type="button" data-action="change-user-password" data-id="${user.id}">Đổi mật khẩu</button>
+                    `
+                    : `<span class="item-meta">Allow list CRM</span>`
                 }
               </div>
             </div>
@@ -1153,12 +1289,10 @@ function renderUserRoleConfig(roleCode) {
   return `
     <div class="action-box user-role-config">
       <p class="section-label blue">Cấu hình phân quyền</p>
-      <p class="confirm-copy">Vai trò khác Agent sẽ dùng bộ quyền bên dưới. Có thể tick lại theo nhu cầu demo.</p>
-      <div class="check-row">
-        <label>
-          <input type="checkbox" id="userAllowPermissionConfig" name="allowPermissionConfig" ${roleCode === "SYSTEM_ADMIN" ? "checked" : ""} />
-          Được phép cấu hình phân quyền
-        </label>
+      <p class="confirm-copy">Vai trò khác Agent sẽ dùng bộ quyền bên dưới và có thể cập nhật mật khẩu đăng nhập portal.</p>
+      <div class="field" style="margin-bottom: 16px">
+        <label for="userPassword">Mật khẩu tạm</label>
+        <input class="input" id="userPassword" name="password" type="password" placeholder="Nhập mật khẩu tạm cho user" autocomplete="new-password" />
       </div>
       ${renderUserPermissionChoices(selectedPermissions)}
     </div>
@@ -1228,6 +1362,7 @@ function openUserModal() {
     }
     const isAgent = roleCode === "AGENT_VIA_SALESFORCE";
     const selectedPermissions = isAgent ? permissionsForRole(roleCode) : formData.getAll("permissions").map(String);
+    const password = String(formData.get("password") || "").trim();
     users.push({
       id: `user-${Date.now()}`,
       username,
@@ -1235,8 +1370,11 @@ function openUserModal() {
       roleCode,
       status: activeStatusLabel(formData.get("statusActive") === "true"),
       allowAgentEntry: isAgent ? formData.get("allowAgentEntry") === "on" : false,
-      allowPermissionConfig: isAgent ? false : formData.get("allowPermissionConfig") === "on",
+      allowPermissionConfig: false,
       permissions: selectedPermissions.length ? selectedPermissions : permissionsForRole(roleCode),
+      passwordSet: !isAgent && Boolean(password),
+      passwordUpdatedBy: !isAgent && password ? currentUser.username : "",
+      passwordUpdatedAt: !isAgent && password ? new Date().toISOString() : "",
       createdFrom: isAgent ? "Salesforce allow list" : "Portal phân quyền",
     });
     closeModal();
@@ -1262,12 +1400,6 @@ function openUserPermissionModal(userId) {
       </div>
       <div class="modal-body">
         <p class="confirm-copy"><strong>${escapeHtml(user.displayName)}</strong> · ${escapeHtml(user.username)} · ${escapeHtml(role?.name || user.roleCode)}</p>
-        <div class="check-row">
-          <label>
-            <input type="checkbox" name="allowPermissionConfig" ${user.allowPermissionConfig ? "checked" : ""} />
-            Được phép cấu hình phân quyền
-          </label>
-        </div>
         ${renderUserPermissionChoices(selectedPermissions)}
         <div class="form-footer">
           <button class="btn secondary" type="button" data-action="close-modal">Hủy</button>
@@ -1282,11 +1414,65 @@ function openUserPermissionModal(userId) {
     const formData = new FormData(event.currentTarget);
     const selected = formData.getAll("permissions").map(String);
     user.permissions = selected.length ? selected : [];
-    user.allowPermissionConfig = formData.get("allowPermissionConfig") === "on";
     user.updatedBy = currentUser.username;
     user.updatedAt = new Date().toISOString();
     closeModal();
     showToast("Đã cập nhật phân quyền user.");
+    render();
+  });
+}
+
+function openUserPasswordModal(userId) {
+  const user = users.find((item) => item.id === userId);
+  if (!user) return;
+  if (user.roleCode === "AGENT_VIA_SALESFORCE") {
+    showToast("Nhân viên tổng đài từ Salesforce không cập nhật mật khẩu trong portal.");
+    return;
+  }
+  openModal(`
+    <form class="modal confirm-modal" id="userPasswordForm" role="dialog" aria-modal="true" aria-labelledby="userPasswordTitle">
+      <div class="modal-header">
+        <h2 class="modal-title" id="userPasswordTitle">Đổi mật khẩu user</h2>
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Đóng">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="confirm-copy"><strong>${escapeHtml(user.displayName)}</strong> · ${escapeHtml(user.username)}</p>
+        <div class="field" style="margin-top: 16px">
+          <label for="newUserPassword">Mật khẩu mới <span class="required">*</span></label>
+          <input class="input" id="newUserPassword" name="password" type="password" required minlength="6" placeholder="Tối thiểu 6 ký tự" autocomplete="new-password" />
+        </div>
+        <div class="field" style="margin-top: 12px">
+          <label for="confirmUserPassword">Nhập lại mật khẩu <span class="required">*</span></label>
+          <input class="input" id="confirmUserPassword" name="confirmPassword" type="password" required minlength="6" placeholder="Nhập lại mật khẩu" autocomplete="new-password" />
+        </div>
+        <div class="form-footer">
+          <button class="btn secondary" type="button" data-action="close-modal">Hủy</button>
+          <button class="btn primary" type="submit">${icon("save")} Cập nhật mật khẩu</button>
+        </div>
+      </div>
+    </form>
+  `);
+
+  document.querySelector("#userPasswordForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const password = String(formData.get("password") || "");
+    const confirmPassword = String(formData.get("confirmPassword") || "");
+    if (password.length < 6) {
+      showToast("Mật khẩu cần tối thiểu 6 ký tự.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      showToast("Mật khẩu nhập lại chưa khớp.");
+      return;
+    }
+    user.passwordSet = true;
+    user.passwordUpdatedBy = currentUser.username;
+    user.passwordUpdatedAt = new Date().toISOString();
+    user.updatedBy = currentUser.username;
+    user.updatedAt = new Date().toISOString();
+    closeModal();
+    showToast("Đã cập nhật mật khẩu user.");
     render();
   });
 }
@@ -1297,7 +1483,7 @@ function renderReports() {
 
   content.innerHTML = `
     ${renderHeader("Báo cáo", "Lọc, xem nhanh và export raw data kết quả khảo sát.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export CSV</button>`)}
-    <section class="panel report-filter-panel">
+    <form class="panel report-filter-panel" id="reportSearchForm">
       <div class="form-grid four">
         <div class="field">
           <label for="reportSurveyFilter">Khảo sát</label>
@@ -1320,56 +1506,52 @@ function renderReports() {
         </div>
         <div class="field">
           <label for="reportCustomerFilter">Khách hàng / Contact ID</label>
-          <input class="input" id="reportCustomerFilter" value="${escapeHtml(state.reportCustomerFilter)}" placeholder="Tên, mã, SĐT..." />
+          <input class="input" id="reportCustomerFilter" value="${escapeHtml(state.reportCustomerDraft || state.reportCustomerFilter)}" placeholder="Tên, mã, SĐT..." autocomplete="off" />
         </div>
       </div>
+      <div class="form-actions-left">
+        <button class="btn secondary" type="submit">${icon("search")} Tìm kiếm</button>
+      </div>
       <p class="item-meta">${visibleReports.length} kết quả phù hợp filter. Export chỉ lấy dữ liệu đã hoàn thành và theo filter hiện tại.</p>
-    </section>
-    <section class="report-list">
+    </form>
+    <section class="panel table-panel report-table-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Danh sách kết quả khảo sát</h2>
+        <span class="item-meta">${visibleReports.length} bản ghi</span>
+      </div>
       ${
         visibleReports.length
-          ? visibleReports
+          ? `
+            <div class="report-table-head" aria-hidden="true">
+              <span>Phiên / Khách hàng</span>
+              <span>Khảo sát</span>
+              <span>Agent</span>
+              <span>Bắt đầu</span>
+              <span>Hoàn thành</span>
+              <span>Trạng thái</span>
+            </div>
+            ${visibleReports
               .map(
                 (report) => `
-                <article class="panel report-card">
-                  <div class="report-card-head">
-                    <div>
-                      <p class="block-eyebrow">Phiên ${escapeHtml(report.sessionId)}</p>
-                      <h2 class="panel-title">${escapeHtml(report.customerName)}</h2>
-                      <p class="page-subtitle">${escapeHtml(report.customerCode || "—")} · ${escapeHtml(report.customerPhone || "Chưa có SĐT")} · ${escapeHtml(report.customerApartment || "Chưa có căn hộ")}</p>
-                    </div>
-                    ${badge("Hoàn thành", true)}
+                <div class="report-table-row">
+                  <div>
+                    <span class="item-title">${escapeHtml(report.sessionId)} · ${escapeHtml(report.customerName)}</span>
+                    <span class="item-meta">${escapeHtml(report.customerCode || "—")} · ${escapeHtml(report.customerPhone || "Chưa có SĐT")} · ${escapeHtml(report.customerApartment || "Chưa có căn hộ")}</span>
                   </div>
-                  <div class="report-info-grid">
-                    <div><span>Khảo sát</span><strong>${escapeHtml(report.surveyName)}</strong></div>
-                    <div><span>Mã khảo sát</span><strong>${escapeHtml(report.surveyCode || "—")}</strong></div>
-                    <div><span>Phiên bản</span><strong>v${escapeHtml(report.surveyVersion || 1)}</strong></div>
-                    <div><span>Bắt đầu</span><strong>${escapeHtml(formatDateTime(report.startedAt))}</strong></div>
-                    <div><span>Hoàn thành</span><strong>${escapeHtml(formatDateTime(report.completedAt))}</strong></div>
+                  <div>
+                    <span class="item-title">${escapeHtml(report.surveyName)}</span>
+                    <span class="item-meta">${escapeHtml(report.surveyCode || "—")} · v${escapeHtml(report.surveyVersion || 1)}</span>
                   </div>
-                  <div class="report-answer-list">
-                    ${report.answers
-                      .map(
-                        (item) => `
-                        <div class="report-answer-row">
-                          <div>
-                            <span class="code-pill">${escapeHtml(item.code)}</span>
-                            <span class="type-pill">${escapeHtml(item.type)}</span>
-                          </div>
-                          <div>
-                            <h3 class="item-title">${escapeHtml(item.text)}</h3>
-                            <p class="item-meta">${escapeHtml(formatAnswerValue(item.answer))}</p>
-                          </div>
-                        </div>
-                      `,
-                      )
-                      .join("")}
-                  </div>
-                </article>
+                  <span class="table-cell">${escapeHtml(displayUserName(report.answeredByUsername))}</span>
+                  <span class="table-cell">${escapeHtml(formatDateTime(report.startedAt))}</span>
+                  <span class="table-cell">${escapeHtml(formatDateTime(report.completedAt))}</span>
+                  <span>${badge(report.status || "Hoàn thành", true)}</span>
+                </div>
               `,
               )
-              .join("")
-          : `<section class="panel"><div class="empty-state">Chưa có kết quả phù hợp filter. Vào Khách hàng → Làm khảo sát → Hoàn thành kiểm tra để ghi nhận báo cáo.</div></section>`
+              .join("")}
+          `
+          : `<div class="empty-state">Chưa có kết quả phù hợp filter. Vào Khách hàng → Làm khảo sát → Hoàn thành kiểm tra để ghi nhận báo cáo.</div>`
       }
     </section>
   `;
@@ -1387,7 +1569,12 @@ function renderReports() {
     renderReports();
   });
   document.querySelector("#reportCustomerFilter")?.addEventListener("input", (event) => {
-    state.reportCustomerFilter = event.target.value;
+    state.reportCustomerDraft = event.target.value;
+  });
+  document.querySelector("#reportSearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.reportCustomerFilter = document.querySelector("#reportCustomerFilter")?.value || "";
+    state.reportCustomerDraft = state.reportCustomerFilter;
     renderReports();
   });
 }
@@ -1450,8 +1637,8 @@ function renderCreateSurvey() {
     <form class="form-card" id="surveyForm" style="margin-top: 22px">
       <div class="form-grid">
         <div class="field">
-          <label for="surveyCode">Mã khảo sát</label>
-          <input class="input" id="surveyCode" name="code" placeholder="VD: SV001" />
+          <label for="surveyCode">Mã khảo sát <span class="required">*</span></label>
+          <input class="input" id="surveyCode" name="code" required placeholder="VD: SV001" />
         </div>
         <div class="field">
           <label for="surveyName">Tên khảo sát <span class="required">*</span></label>
@@ -1462,12 +1649,12 @@ function renderCreateSurvey() {
           <textarea class="textarea" id="surveyDescription" name="description" placeholder="Mô tả mục đích khảo sát..."></textarea>
         </div>
         <div class="field">
-          <label for="surveyDepartment">Phòng ban</label>
-          <input class="input" id="surveyDepartment" name="department" placeholder="Phòng ban sở hữu" />
+          <label for="surveyDepartment">Phòng ban <span class="required">*</span></label>
+          <input class="input" id="surveyDepartment" name="department" required placeholder="Phòng ban sở hữu" />
         </div>
         <div class="field">
-          <label for="surveyChannel">Kênh trả lời</label>
-          <select class="select" id="surveyChannel" name="channel">
+          <label for="surveyChannel">Kênh trả lời <span class="required">*</span></label>
+          <select class="select" id="surveyChannel" name="channel" required>
             <option>Agent nhập liệu</option>
             <option>Khách hàng tự trả lời</option>
             <option>Cả hai kênh</option>
@@ -1482,12 +1669,12 @@ function renderCreateSurvey() {
           </select>
         </div>
         <div class="field">
-          <label for="surveyStart">Ngày bắt đầu</label>
-          <input class="input" id="surveyStart" name="startDate" type="date" />
+          <label for="surveyStart">Ngày bắt đầu <span class="required">*</span></label>
+          <input class="input" id="surveyStart" name="startDate" type="date" required />
         </div>
         <div class="field">
-          <label for="surveyEnd">Ngày kết thúc</label>
-          <input class="input" id="surveyEnd" name="endDate" type="date" />
+          <label for="surveyEnd">Ngày kết thúc <span class="required">*</span></label>
+          <input class="input" id="surveyEnd" name="endDate" type="date" required />
         </div>
       </div>
       <div class="form-footer">
@@ -1511,6 +1698,8 @@ function renderCreateSurvey() {
       description: data.description.trim(),
       startDate: data.startDate,
       endDate: data.endDate,
+      createdBy: currentUser.username,
+      createdAt: new Date().toISOString(),
     };
     surveys.unshift(survey);
     state.selectedSurveyId = survey.id;
@@ -1533,8 +1722,8 @@ function openSurveyEditModal(surveyId) {
       <form class="modal-body" id="surveyEditForm">
         <div class="form-grid">
           <div class="field">
-            <label for="editSurveyCode">Mã khảo sát</label>
-            <input class="input" id="editSurveyCode" name="code" value="${escapeHtml(survey.code)}" />
+            <label for="editSurveyCode">Mã khảo sát <span class="required">*</span></label>
+            <input class="input" id="editSurveyCode" name="code" required value="${escapeHtml(survey.code)}" />
           </div>
           <div class="field">
             <label for="editSurveyName">Tên khảo sát <span class="required">*</span></label>
@@ -1545,12 +1734,12 @@ function openSurveyEditModal(surveyId) {
             <textarea class="textarea" id="editSurveyDescription" name="description">${escapeHtml(survey.description || "")}</textarea>
           </div>
           <div class="field">
-            <label for="editSurveyDepartment">Phòng ban</label>
-            <input class="input" id="editSurveyDepartment" name="department" value="${escapeHtml(survey.department)}" />
+            <label for="editSurveyDepartment">Phòng ban <span class="required">*</span></label>
+            <input class="input" id="editSurveyDepartment" name="department" required value="${escapeHtml(survey.department)}" />
           </div>
           <div class="field">
-            <label for="editSurveyChannel">Kênh trả lời</label>
-            <select class="select" id="editSurveyChannel" name="channel">
+            <label for="editSurveyChannel">Kênh trả lời <span class="required">*</span></label>
+            <select class="select" id="editSurveyChannel" name="channel" required>
               ${["Agent nhập liệu", "Khách hàng tự trả lời", "Cả hai kênh"].map((channel) => `<option ${channel === survey.channel ? "selected" : ""}>${channel}</option>`).join("")}
             </select>
           </div>
@@ -1561,12 +1750,12 @@ function openSurveyEditModal(surveyId) {
             </select>
           </div>
           <div class="field">
-            <label for="editSurveyStart">Ngày bắt đầu</label>
-            <input class="input" id="editSurveyStart" name="startDate" type="date" value="${escapeHtml(survey.startDate || "")}" />
+            <label for="editSurveyStart">Ngày bắt đầu <span class="required">*</span></label>
+            <input class="input" id="editSurveyStart" name="startDate" type="date" required value="${escapeHtml(survey.startDate || "")}" />
           </div>
           <div class="field">
-            <label for="editSurveyEnd">Ngày kết thúc</label>
-            <input class="input" id="editSurveyEnd" name="endDate" type="date" value="${escapeHtml(survey.endDate || "")}" />
+            <label for="editSurveyEnd">Ngày kết thúc <span class="required">*</span></label>
+            <input class="input" id="editSurveyEnd" name="endDate" type="date" required value="${escapeHtml(survey.endDate || "")}" />
           </div>
         </div>
         <div class="form-footer">
@@ -1580,7 +1769,7 @@ function openSurveyEditModal(surveyId) {
   document.querySelector("#surveyEditForm").addEventListener("submit", (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-    Object.assign(survey, {
+    const payload = {
       code: data.code.trim(),
       name: data.name.trim(),
       description: data.description.trim(),
@@ -1589,10 +1778,25 @@ function openSurveyEditModal(surveyId) {
       status: data.status,
       startDate: data.startDate,
       endDate: data.endDate,
-    });
-    closeModal();
-    showToast("Đã cập nhật khảo sát.");
-    render();
+      updatedBy: currentUser.username,
+      updatedAt: new Date().toISOString(),
+    };
+    const applyUpdate = () => {
+      Object.assign(survey, payload);
+      closeModal();
+      showToast("Đã cập nhật khảo sát.");
+      render();
+    };
+    if (payload.status !== survey.status) {
+      openConfirmModal({
+        title: "Cập nhật trạng thái khảo sát?",
+        message: `Trạng thái khảo sát "${survey.name}" sẽ đổi từ "${survey.status}" sang "${payload.status}".`,
+        confirmText: "Cập nhật trạng thái",
+        onConfirm: applyUpdate,
+      });
+      return;
+    }
+    applyUpdate();
   });
 }
 
@@ -1627,6 +1831,10 @@ function deleteSurvey(surveyId) {
   }
   const index = surveys.findIndex((survey) => survey.id === surveyId);
   if (index === -1) return;
+  if (isSurveyStatusActive(surveys[index].status)) {
+    showToast("Không thể xóa khảo sát đang hoạt động.");
+    return;
+  }
   surveys.splice(index, 1);
   for (let i = questions.length - 1; i >= 0; i -= 1) {
     if (questions[i].surveyId === surveyId) questions.splice(i, 1);
@@ -1768,12 +1976,12 @@ function renderBranchingTab(surveyRs) {
             ? `
               <div class="rule-table-head" aria-hidden="true">
                 <span>Mã / Tên điều kiện</span>
-                <span>Nếu</span>
-                <span>Thì</span>
                 <span>Ưu tiên</span>
                 <span>Trạng thái</span>
                 <span>Người tạo</span>
                 <span>Ngày tạo</span>
+                <span>Người cập nhật</span>
+                <span>Ngày cập nhật</span>
                 <span>Thao tác</span>
               </div>
             `
@@ -1783,25 +1991,17 @@ function renderBranchingTab(surveyRs) {
           surveyRs.length
             ? surveyRs
                 .map(
-                  (rule) => `
+                  (rule) => {
+                    const groups = ruleGroups(rule);
+                    return `
                   <article class="rule-card rule-table-row ${rule.active ? "" : "is-inactive"}">
                     <div class="rule-card-main">
                       <div class="question-card-meta">
                         <span class="code-pill">${escapeHtml(rule.code)}</span>
-                        <span class="type-pill">${escapeHtml(rule.operator)}</span>
+                        <span class="type-pill">${groups.length} nhóm HOẶC</span>
                       </div>
                       <h3 class="question-title">${escapeHtml(rule.name)}</h3>
                       ${rule.description ? `<p class="item-meta">${escapeHtml(rule.description)}</p>` : ""}
-                    </div>
-                    <div class="rule-flow compact-flow">
-                      <span>${escapeHtml(rule.source || "—")}</span>
-                      ${rule.matrixRow ? `<span>${escapeHtml(rule.matrixRow)}</span>` : ""}
-                      <span>${escapeHtml(rule.operator)}</span>
-                      <span>${escapeHtml(rule.value || "—")}</span>
-                    </div>
-                    <div class="rule-flow compact-flow">
-                      <span>${escapeHtml(rule.action)}</span>
-                      <span>${escapeHtml(rule.target || "—")}</span>
                     </div>
                     <span class="table-cell">${rule.priority}</span>
                     <div class="status-toggle-cell">
@@ -1810,13 +2010,20 @@ function renderBranchingTab(surveyRs) {
                     </div>
                     <span class="table-cell">${escapeHtml(displayUserName(rule.createdBy || rule.updatedBy))}</span>
                     <span class="table-cell">${escapeHtml(displayDateTime(rule.createdAt || rule.updatedAt))}</span>
+                    <span class="table-cell">${escapeHtml(displayUserName(rule.updatedBy))}</span>
+                    <span class="table-cell">${escapeHtml(displayDateTime(rule.updatedAt))}</span>
                     <div class="question-actions">
                       ${actionButton("view-rule", rule.id, "eye", "Xem điều kiện")}
-                      ${actionButton("edit-rule", rule.id, "edit", "Sửa điều kiện")}
+                      ${
+                        rule.active
+                          ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Tắt điều kiện trước khi sửa" title="Tắt điều kiện trước khi sửa">${icon("edit")}</button>`
+                          : actionButton("edit-rule", rule.id, "edit", "Sửa điều kiện")
+                      }
                       ${actionButton("delete-rule", rule.id, "trash", "Xóa điều kiện", "danger")}
                     </div>
                   </article>
-                `,
+                `;
+                  },
                 )
                 .join("")
             : `<div class="empty-state">Chưa có điều kiện rẽ nhánh. Hãy thêm điều kiện đầu tiên.</div>`
@@ -1846,7 +2053,7 @@ function renderEntryTab(surveyQs) {
           ${surveyQs
             .map(
               (question, index) => `
-              <button class="entry-card ${index === state.selectedQuestionIndex ? "active" : ""}" type="button" data-action="select-question" data-index="${index}">
+              <button class="entry-card ${index === state.selectedQuestionIndex ? "active" : ""}" type="button" disabled title="Làm khảo sát theo thứ tự từ câu 1">
                 <h3 class="item-title">${escapeHtml(question.code)}</h3>
                 <div class="item-meta">${escapeHtml(question.text)}</div>
               </button>
@@ -1926,7 +2133,7 @@ function renderBranching() {
                   <span class="code-pill">${escapeHtml(rule.code)}</span>
                   <div>
                     <h3 class="item-title">${escapeHtml(rule.name)}</h3>
-                    <div class="item-meta">Nếu ${escapeHtml(rule.source)}${rule.matrixRow ? ` / ${escapeHtml(rule.matrixRow)}` : ""} ${escapeHtml(rule.operator)} ${escapeHtml(rule.value)} thì ${escapeHtml(rule.action)} ${escapeHtml(rule.target)}</div>
+                    <div class="item-meta">Nếu ${escapeHtml(rule.source)}: ${ruleGroups(rule).map(describeRuleGroup).join(" HOẶC ")}</div>
                   </div>
                   <span class="type-pill">Ưu tiên ${rule.priority}</span>
                   ${badge(rule.active ? "Kích hoạt" : "Tắt", rule.active)}
@@ -1979,7 +2186,7 @@ function renderEntry() {
         ${surveyQs
           .map(
             (question, index) => `
-            <button class="entry-card ${index === state.selectedQuestionIndex ? "active" : ""}" type="button" data-action="select-question" data-index="${index}">
+            <button class="entry-card ${index === state.selectedQuestionIndex ? "active" : ""}" type="button" disabled title="Làm khảo sát theo thứ tự từ câu 1">
               <h3 class="item-title">${escapeHtml(question.code)}</h3>
               <div class="item-meta">${escapeHtml(question.text)}</div>
             </button>
@@ -2421,28 +2628,28 @@ function comparisonValueOptions(question, selectedValue = "") {
   `;
 }
 
-function comparisonValueControl(question, selectedValue = "") {
+function comparisonValueControl(question, selectedValue = "", fieldName = "value", fieldId = "ruleValue") {
   if (question?.type === "Số") {
-    return `<input class="input" id="ruleValue" name="value" type="number" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị số" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" type="number" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị số" required />`;
   }
   if (question?.type === "Ngày") {
-    return `<input class="input" id="ruleValue" name="value" type="date" value="${escapeHtml(selectedValue)}" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" type="date" value="${escapeHtml(selectedValue)}" required />`;
   }
   if (!questionSupportsOptions(question?.type) && !isMatrixQuestionType(question?.type)) {
-    return `<input class="input" id="ruleValue" name="value" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị so sánh" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị so sánh" required />`;
   }
   return `
-    <select class="select" id="ruleValue" name="value" required>
+    <select class="select" id="${fieldId}" name="${fieldName}" required>
       ${comparisonValueOptions(question, selectedValue)}
     </select>
   `;
 }
 
-function matrixRuleRowControl(question, selectedRow = "") {
+function matrixRuleRowControl(question, selectedRow = "", fieldName = "matrixRow", fieldId = "ruleMatrixRow") {
   const rows = isMatrixQuestionType(question?.type) ? matrixRowsForQuestion(question) : [];
   return `
-    <label for="ruleMatrixRow">Dòng ma trận</label>
-    <select class="select" id="ruleMatrixRow" name="matrixRow" ${rows.length ? "required" : ""}>
+    <label for="${fieldId}">Dòng ma trận</label>
+    <select class="select" id="${fieldId}" name="${fieldName}" ${rows.length ? "required" : ""}>
       ${
         rows.length
           ? rows.map((row) => `<option value="${escapeHtml(row)}" ${row === selectedRow ? "selected" : ""}>${escapeHtml(row)}</option>`).join("")
@@ -2452,21 +2659,177 @@ function matrixRuleRowControl(question, selectedRow = "") {
   `;
 }
 
-function updateRuleValueOptions(selectedValue = "") {
+function renderRuleGroupRows(groups = [], sourceQuestion = null) {
+  const normalizedGroups = groups.length ? groups : ruleGroups({});
+  const operatorOptions = ["Bằng (=)", "Khác (!=)", "Lớn hơn", "Nhỏ hơn", "Nhỏ hơn hoặc bằng", "Có chứa", "Không chứa"];
+  const actionOptions = ["Hiển thị câu hỏi", "Ẩn câu hỏi", "Bỏ qua câu hỏi", "Bắt buộc trả lời", "Kết thúc khảo sát"];
+  const optionList = (selectedCode = "") => {
+    const surveyQs = selectedQuestions();
+    const endSelected = selectedCode === END_SURVEY_TARGET || selectedCode === "Câu hỏi kết thúc";
+    return surveyQs.length
+      ? `<option value="">-- Chọn câu hỏi --</option><option value="${END_SURVEY_TARGET}" ${endSelected ? "selected" : ""}>Câu hỏi kết thúc</option>${surveyQs.map((question) => `<option value="${question.code}" ${question.code === selectedCode ? "selected" : ""}>${question.code} - ${escapeHtml(question.text)}</option>`).join("")}`
+      : `<option value="">-- Chọn câu hỏi --</option><option value="${END_SURVEY_TARGET}" ${endSelected ? "selected" : ""}>Câu hỏi kết thúc</option>`;
+  };
+
+  return normalizedGroups
+    .map((group, index) => {
+      const groupId = `ruleGroup${index + 1}`;
+      const selectedTarget = group.action === "Kết thúc khảo sát" ? END_SURVEY_TARGET : group.target;
+      return `
+        <article class="rule-group-card" data-rule-group data-group-id="${escapeHtml(group.id || `group-${index + 1}`)}">
+          <div class="rule-group-header">
+            <div>
+              <span class="code-pill">Nhóm ${index + 1}</span>
+              <span class="type-pill">${index === 0 ? "Điều kiện đầu tiên" : "HOẶC"}</span>
+            </div>
+            <button class="icon-action danger" type="button" data-action="remove-rule-group" aria-label="Xóa nhóm điều kiện">${icon("trash")}</button>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="${groupId}Operator">Toán tử so sánh</label>
+              <select class="select" id="${groupId}Operator" name="operator">
+                ${operatorOptions.map((operator) => `<option ${operator === group.operator ? "selected" : ""}>${operator}</option>`).join("")}
+              </select>
+            </div>
+            ${
+              isMatrixQuestionType(sourceQuestion?.type)
+                ? `<div class="field rule-matrix-row-field">${matrixRuleRowControl(sourceQuestion, group.matrixRow || "", "matrixRow", `${groupId}MatrixRow`)}</div>`
+                : ""
+            }
+            <div class="field rule-value-field">
+              <label for="${groupId}Value">Giá trị so sánh</label>
+              ${comparisonValueControl(sourceQuestion, group.value || "", "value", `${groupId}Value`)}
+            </div>
+            <div class="field">
+              <label for="${groupId}Action">Loại hành động</label>
+              <select class="select" id="${groupId}Action" name="action">
+                ${actionOptions.map((action) => `<option ${action === group.action ? "selected" : ""}>${action}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label for="${groupId}Target">Câu hỏi đích</label>
+              <select class="select" id="${groupId}Target" name="target">
+                ${optionList(selectedTarget)}
+              </select>
+            </div>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function updateRuleGroupFields() {
   const form = document.querySelector("#ruleForm");
   if (!form) return;
   const sourceCode = form.elements.source.value;
   const sourceQuestion = selectedQuestions().find((question) => question.code === sourceCode);
-  const matrixRowField = form.querySelector("#ruleMatrixRowField");
-  const valueField = form.querySelector("#ruleValueField");
-  if (matrixRowField) {
-    matrixRowField.hidden = !isMatrixQuestionType(sourceQuestion?.type);
-    matrixRowField.innerHTML = isMatrixQuestionType(sourceQuestion?.type) ? matrixRuleRowControl(sourceQuestion) : "";
-  }
-  valueField.innerHTML = `
-    <label for="ruleValue">Giá trị so sánh</label>
-    ${comparisonValueControl(sourceQuestion, selectedValue)}
-  `;
+  const rows = [...form.querySelectorAll("[data-rule-group]")];
+  const groups = rows.map((row) => {
+    const selectedTarget = row.querySelector('[name="target"]')?.value || "";
+    const isEndTarget = selectedTarget === END_SURVEY_TARGET;
+    return {
+      operator: row.querySelector('[name="operator"]')?.value || "Bằng (=)",
+      matrixRow: row.querySelector('[name="matrixRow"]')?.value || "",
+      value: row.querySelector('[name="value"]')?.value || "",
+      action: isEndTarget ? "Kết thúc khảo sát" : row.querySelector('[name="action"]')?.value || "Hiển thị câu hỏi",
+      target: isEndTarget ? END_SURVEY_TARGET : selectedTarget,
+    };
+  });
+  form.querySelector("#ruleGroupList").innerHTML = renderRuleGroupRows(groups, sourceQuestion);
+}
+
+function renderReadOnlyRuleGroupRows(rule, sourceQuestion) {
+  return ruleGroups(rule)
+    .map(
+      (group, index) => `
+        <article class="rule-group-card">
+          <div class="rule-group-header">
+            <div>
+              <span class="code-pill">Nhóm ${index + 1}</span>
+              <span class="type-pill">${index === 0 ? "Điều kiện đầu tiên" : "HOẶC"}</span>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label>Toán tử so sánh</label>
+              <input class="input" value="${escapeHtml(group.operator || "—")}" readonly />
+            </div>
+            ${
+              isMatrixQuestionType(sourceQuestion?.type)
+                ? `<div class="field"><label>Dòng ma trận</label><input class="input" value="${escapeHtml(group.matrixRow || "—")}" readonly /></div>`
+                : ""
+            }
+            <div class="field">
+              <label>Giá trị so sánh</label>
+              <input class="input" value="${escapeHtml(group.value || "—")}" readonly />
+            </div>
+            <div class="field">
+              <label>Loại hành động</label>
+              <input class="input" value="${escapeHtml(group.action || "—")}" readonly />
+            </div>
+            <div class="field">
+              <label>Câu hỏi đích</label>
+              <input class="input" value="${escapeHtml(group.action === "Kết thúc khảo sát" ? "Câu hỏi kết thúc" : group.target || "—")}" readonly />
+            </div>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function openRuleViewModal(ruleId) {
+  const rule = rules.find((item) => item.id === ruleId);
+  if (!rule) return;
+  const sourceQuestion = selectedQuestions().find((question) => question.code === rule.source);
+  openModal(`
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="ruleViewTitle">
+      <div class="modal-header">
+        <h2 class="modal-title" id="ruleViewTitle">Chi tiết điều kiện rẽ nhánh</h2>
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Đóng">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="field">
+            <label>Mã điều kiện</label>
+            <input class="input" value="${escapeHtml(rule.code || "—")}" readonly />
+          </div>
+          <div class="field">
+            <label>Tên điều kiện</label>
+            <input class="input" value="${escapeHtml(rule.name || "—")}" readonly />
+          </div>
+          <div class="field full">
+            <label>Mô tả</label>
+            <input class="input" value="${escapeHtml(rule.description || "—")}" readonly />
+          </div>
+        </div>
+        <section class="condition-box">
+          <h3 class="section-label">NẾU (ĐIỀU KIỆN)</h3>
+          <div class="field full">
+            <label>Câu hỏi nguồn</label>
+            <input class="input" value="${escapeHtml(rule.source || "—")} - ${escapeHtml(sourceQuestion?.text || "")}" readonly />
+          </div>
+          <div class="rule-group-toolbar">
+            <div>
+              <h3 class="section-label blue">NHÓM SO SÁNH + HÀNH ĐỘNG</h3>
+              <p class="item-meta">Chế độ xem chi tiết, không cho chỉnh sửa.</p>
+            </div>
+          </div>
+          <div class="rule-group-list">
+            ${renderReadOnlyRuleGroupRows(rule, sourceQuestion)}
+          </div>
+        </section>
+        <div class="field" style="margin-top: 16px; max-width: 125px">
+          <label>Độ ưu tiên</label>
+          <input class="input" value="${escapeHtml(rule.priority || "—")}" readonly />
+        </div>
+        <div class="form-footer">
+          <button class="btn secondary" type="button" data-action="close-modal">Đóng</button>
+        </div>
+      </div>
+    </div>
+  `);
 }
 
 function openRuleModal(ruleId = null, sourceQuestionId = null) {
@@ -2477,6 +2840,7 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
   const nextOrder = selectedRules().length + 1;
   const selectedSourceCode = editingRule?.source || preselectedQuestion?.code || surveyQs[0]?.code || "";
   const selectedSourceQuestion = surveyQs.find((question) => question.code === selectedSourceCode);
+  const editingGroups = editingRule ? ruleGroups(editingRule) : ruleGroups({});
   const optionList = (selectedCode = "") =>
     surveyQs.length
       ? surveyQs.map((question) => `<option value="${question.code}" ${question.code === selectedCode ? "selected" : ""}>${question.code} - ${escapeHtml(question.text)}</option>`).join("")
@@ -2513,40 +2877,16 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
                 ${optionList(selectedSourceCode)}
               </select>
             </div>
-            <div class="field">
-              <label for="ruleOperator">Toán tử so sánh</label>
-              <select class="select" id="ruleOperator" name="operator">
-                ${["Bằng (=)", "Khác (!=)", "Lớn hơn", "Nhỏ hơn", "Nhỏ hơn hoặc bằng", "Có chứa", "Không chứa"].map((operator) => `<option ${operator === editingRule?.operator ? "selected" : ""}>${operator}</option>`).join("")}
-              </select>
-            </div>
-            ${
-              isMatrixQuestionType(selectedSourceQuestion?.type)
-                ? `<div class="field" id="ruleMatrixRowField">${matrixRuleRowControl(selectedSourceQuestion, editingRule?.matrixRow || "")}</div>`
-                : ""
-            }
-            <div class="field" id="ruleValueField">
-              <label for="ruleValue">Giá trị so sánh</label>
-              ${comparisonValueControl(selectedSourceQuestion, editingRule?.value || "")}
-            </div>
           </div>
-        </section>
-
-        <section class="action-box">
-          <h3 class="section-label blue">THÌ (HÀNH ĐỘNG)</h3>
-          <div class="form-grid">
-            <div class="field">
-              <label for="ruleAction">Loại hành động</label>
-              <select class="select" id="ruleAction" name="action">
-                ${["Hiển thị câu hỏi", "Ẩn câu hỏi", "Bỏ qua câu hỏi", "Bắt buộc trả lời", "Kết thúc khảo sát"].map((action) => `<option ${action === editingRule?.action ? "selected" : ""}>${action}</option>`).join("")}
-              </select>
+          <div class="rule-group-toolbar">
+            <div>
+              <h3 class="section-label blue">NHÓM SO SÁNH + HÀNH ĐỘNG</h3>
+              <p class="item-meta">Các nhóm trong cùng điều kiện được nối bằng HOẶC. Nhóm nào khớp trước sẽ chạy hành động của nhóm đó.</p>
             </div>
-            <div class="field">
-              <label for="ruleTarget">Câu hỏi đích</label>
-              <select class="select" id="ruleTarget" name="target">
-                <option value="">-- Chọn câu hỏi --</option>
-                ${optionList(editingRule?.target)}
-              </select>
-            </div>
+            <button class="btn secondary" type="button" data-action="add-rule-group">${icon("plus")} Thêm nhóm</button>
+          </div>
+          <div class="rule-group-list" id="ruleGroupList">
+            ${renderRuleGroupRows(editingGroups, selectedSourceQuestion)}
           </div>
         </section>
 
@@ -2569,17 +2909,43 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = Object.fromEntries(new FormData(form).entries());
+    const sourceQuestion = selectedQuestions().find((question) => question.code === data.source);
+    const groups = [...form.querySelectorAll("[data-rule-group]")]
+      .map((row, index) => {
+        const selectedTarget = row.querySelector('[name="target"]')?.value || "";
+        const isEndTarget = selectedTarget === END_SURVEY_TARGET;
+        return {
+          id: row.dataset.groupId || `g-${Date.now()}-${index}`,
+          operator: row.querySelector('[name="operator"]')?.value || "Bằng (=)",
+          matrixRow: isMatrixQuestionType(sourceQuestion?.type) ? row.querySelector('[name="matrixRow"]')?.value || "" : "",
+          value: (row.querySelector('[name="value"]')?.value || "").trim(),
+          action: isEndTarget ? "Kết thúc khảo sát" : row.querySelector('[name="action"]')?.value || "Hiển thị câu hỏi",
+          target: isEndTarget ? "" : selectedTarget,
+        };
+      })
+      .filter((group) => group.value || group.target);
+    if (!groups.length) {
+      showToast("Cần cấu hình ít nhất một nhóm điều kiện.");
+      return;
+    }
+    const invalidGroupIndex = groups.findIndex((group) => !group.value || (group.action !== "Kết thúc khảo sát" && !group.target));
+    if (invalidGroupIndex >= 0) {
+      showToast(`Nhóm ${invalidGroupIndex + 1} cần đủ giá trị so sánh và câu hỏi đích.`);
+      return;
+    }
+    const firstGroup = groups[0];
     const payload = {
       surveyId: selectedSurvey().id,
       code: data.code.trim() || `R${String(nextOrder).padStart(2, "0")}`,
       name: data.name.trim(),
       description: data.description.trim(),
       source: data.source,
-      operator: data.operator,
-      matrixRow: isMatrixQuestionType(selectedQuestions().find((question) => question.code === data.source)?.type) ? data.matrixRow || "" : "",
-      value: data.value.trim(),
-      action: data.action,
-      target: data.target,
+      groups,
+      operator: firstGroup.operator,
+      matrixRow: firstGroup.matrixRow,
+      value: firstGroup.value,
+      action: firstGroup.action,
+      target: firstGroup.target,
       priority: Number(data.priority) || nextOrder,
       active: form.elements.active.checked,
     };
@@ -2590,7 +2956,7 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
     render();
   });
 
-  document.querySelector("#ruleSource").addEventListener("change", () => updateRuleValueOptions());
+  document.querySelector("#ruleSource").addEventListener("change", () => updateRuleGroupFields());
 }
 
 function openCustomerSurveyModal(customerId) {
@@ -2623,7 +2989,10 @@ function openCustomerSurveyModal(customerId) {
             ? `
               <div class="field" style="margin-top: 18px">
                 <label for="customerSurveySearch">Tìm kiếm khảo sát active</label>
-                <input class="input" id="customerSurveySearch" name="surveySearch" placeholder="Tìm theo tên, mã khảo sát, phòng ban..." autocomplete="off" />
+                <div class="inline-search">
+                  <input class="input" id="customerSurveySearch" name="surveySearch" placeholder="Tìm theo tên, mã khảo sát, phòng ban..." autocomplete="off" />
+                  <button class="btn secondary" type="button" data-action="search-customer-survey">${icon("search")} Tìm kiếm</button>
+                </div>
               </div>
               <div class="field" style="margin-top: 18px">
                 <label for="customerSurveySelect">Chọn khảo sát đang active</label>
@@ -2648,13 +3017,14 @@ function openCustomerSurveyModal(customerId) {
   const searchInput = document.querySelector("#customerSurveySearch");
   const selectInput = document.querySelector("#customerSurveySelect");
   const resultText = document.querySelector("#customerSurveySearchResult");
-  searchInput?.addEventListener("input", (event) => {
-    const keyword = normalizedText(event.target.value);
+  const applySurveySearch = () => {
+    const keyword = normalizedText(searchInput?.value || "");
     const filtered = availableSurveys.filter((survey) => normalizedText(`${survey.name} ${survey.code} ${survey.department}`).includes(keyword));
     selectInput.innerHTML = filtered.length ? surveyOptions(filtered) : `<option value="">Không tìm thấy khảo sát active phù hợp</option>`;
     selectInput.disabled = !filtered.length;
     resultText.textContent = filtered.length ? `${filtered.length} khảo sát đang active phù hợp` : "Không tìm thấy khảo sát active phù hợp";
-  });
+  };
+  document.querySelector('[data-action="search-customer-survey"]')?.addEventListener("click", applySurveySearch);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget).entries());
@@ -2721,6 +3091,29 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2200);
 }
 
+function markRequiredErrors(form) {
+  const invalidFields = [...form.querySelectorAll("[required]")].filter((field) => !String(field.value || "").trim());
+  form.querySelectorAll(".is-invalid").forEach((field) => field.classList.remove("is-invalid"));
+  invalidFields.forEach((field) => field.classList.add("is-invalid"));
+  if (invalidFields[0]) invalidFields[0].focus();
+  return invalidFields;
+}
+
+document.addEventListener(
+  "submit",
+  (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const invalidFields = markRequiredErrors(form);
+    if (invalidFields.length) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      showToast("Vui lòng nhập đầy đủ các field bắt buộc (*).");
+    }
+  },
+  true,
+);
+
 document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
     state.view = button.dataset.view;
@@ -2768,7 +3161,7 @@ document.addEventListener("click", (event) => {
     const rule = rules.find((item) => item.id === actionTarget.dataset.id);
     openConfirmModal({
       title: "Xóa điều kiện?",
-      message: `Điều kiện "${rule?.code || "đã chọn"}" sẽ bị xóa khỏi khảo sát hiện tại.`,
+      message: `Điều kiện "${rule?.code || "đã chọn"}" sẽ bị xóa khỏi khảo sát hiện tại và không còn được áp dụng khi làm khảo sát.`,
       confirmText: "Xóa điều kiện",
       onConfirm: () => {
         const index = rules.findIndex((item) => item.id === actionTarget.dataset.id);
@@ -2777,6 +3170,27 @@ document.addEventListener("click", (event) => {
           showToast("Đã xóa điều kiện rẽ nhánh.");
           render();
         }
+      },
+    });
+    return;
+  }
+
+  if (action === "toggle-rule") {
+    const rule = rules.find((item) => item.id === actionTarget.dataset.id);
+    if (!rule) return;
+    const willActivate = !rule.active;
+    openConfirmModal({
+      title: willActivate ? "Bật điều kiện?" : "Tắt điều kiện?",
+      message: willActivate
+        ? `Điều kiện "${rule.code}" sẽ được áp dụng lại khi làm khảo sát.`
+        : `Điều kiện "${rule.code}" sẽ chuyển sang không hoạt động và không còn được áp dụng khi làm khảo sát.`,
+      confirmText: willActivate ? "Bật điều kiện" : "Tắt điều kiện",
+      onConfirm: () => {
+        rule.active = willActivate;
+        rule.updatedBy = currentUser.username;
+        rule.updatedAt = new Date().toISOString();
+        showToast(willActivate ? "Đã bật điều kiện." : "Đã tắt điều kiện. Điều kiện này sẽ không được áp dụng khi làm khảo sát.");
+        render();
       },
     });
     return;
@@ -2812,9 +3226,19 @@ document.addEventListener("click", (event) => {
   if (action === "toggle-customer-active") {
     const customer = customers.find((item) => item.id === actionTarget.dataset.id);
     if (customer) {
-      customer.status = isCustomerActive(customer) ? "Không hoạt động" : "Hoạt động";
-      showToast(isCustomerActive(customer) ? "Đã bật khách hàng." : "Đã tắt khách hàng.");
-      renderCustomers();
+      const willActivate = !isCustomerActive(customer);
+      openConfirmModal({
+        title: willActivate ? "Bật khách hàng?" : "Tắt khách hàng?",
+        message: `${willActivate ? "Bật" : "Tắt"} trạng thái hoạt động của khách hàng "${customer.name}".`,
+        confirmText: willActivate ? "Bật khách hàng" : "Tắt khách hàng",
+        onConfirm: () => {
+          customer.status = willActivate ? "Hoạt động" : "Không hoạt động";
+          customer.updatedBy = currentUser.username;
+          customer.updatedAt = new Date().toISOString();
+          showToast(willActivate ? "Đã bật khách hàng." : "Đã tắt khách hàng.");
+          renderCustomers();
+        },
+      });
     }
   }
   if (action === "reset-customer-context") {
@@ -2853,20 +3277,43 @@ document.addEventListener("click", (event) => {
     }
   }
   if (action === "edit-user-permissions") openUserPermissionModal(actionTarget.dataset.id);
+  if (action === "change-user-password") openUserPasswordModal(actionTarget.dataset.id);
   if (action === "toggle-user-allowlist") {
     const user = users.find((item) => item.id === actionTarget.dataset.id);
     if (user) {
-      user.allowAgentEntry = !user.allowAgentEntry;
-      showToast(user.allowAgentEntry ? "Đã thêm user vào allow list Agent." : "Đã gỡ user khỏi allow list Agent.");
-      render();
+      const willAllow = !user.allowAgentEntry;
+      openConfirmModal({
+        title: willAllow ? "Thêm vào allow list Agent?" : "Gỡ khỏi allow list Agent?",
+        message: willAllow
+          ? `User "${user.displayName}" sẽ được phép tạo/làm khảo sát từ Salesforce khi đang hoạt động.`
+          : `User "${user.displayName}" sẽ bị gỡ khỏi allow list Agent và không thể tạo/làm khảo sát từ Salesforce.`,
+        confirmText: willAllow ? "Thêm allow list" : "Gỡ allow list",
+        onConfirm: () => {
+          user.allowAgentEntry = willAllow;
+          user.updatedBy = currentUser.username;
+          user.updatedAt = new Date().toISOString();
+          showToast(willAllow ? "Đã thêm user vào allow list Agent." : "Đã gỡ user khỏi allow list Agent.");
+          render();
+        },
+      });
     }
   }
   if (action === "toggle-user-permission-config") {
     const user = users.find((item) => item.id === actionTarget.dataset.id);
     if (user) {
-      user.allowPermissionConfig = !user.allowPermissionConfig;
-      showToast(user.allowPermissionConfig ? "Đã bật quyền cấu hình phân quyền." : "Đã tắt quyền cấu hình phân quyền.");
-      render();
+      const willAllow = !user.allowPermissionConfig;
+      openConfirmModal({
+        title: willAllow ? "Bật quyền cấu hình?" : "Tắt quyền cấu hình?",
+        message: `${willAllow ? "Bật" : "Tắt"} quyền cấu hình phân quyền của user "${user.displayName}".`,
+        confirmText: willAllow ? "Bật quyền" : "Tắt quyền",
+        onConfirm: () => {
+          user.allowPermissionConfig = willAllow;
+          user.updatedBy = currentUser.username;
+          user.updatedAt = new Date().toISOString();
+          showToast(willAllow ? "Đã bật quyền cấu hình phân quyền." : "Đã tắt quyền cấu hình phân quyền.");
+          render();
+        },
+      });
     }
   }
   if (action === "open-survey") {
@@ -2879,45 +3326,94 @@ document.addEventListener("click", (event) => {
   if (action === "toggle-survey-active") {
     const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
     if (survey) {
-      survey.status = isSurveyStatusActive(survey.status) ? "Ngưng hoạt động" : "Hoạt động";
-      showToast(isSurveyStatusActive(survey.status) ? "Đã bật khảo sát." : "Đã ngưng hoạt động khảo sát.");
-      render();
+      const willActivate = !isSurveyStatusActive(survey.status);
+      openConfirmModal({
+        title: willActivate ? "Bật khảo sát?" : "Ngưng hoạt động khảo sát?",
+        message: `${willActivate ? "Bật" : "Ngưng hoạt động"} khảo sát "${survey.name}".`,
+        confirmText: willActivate ? "Bật khảo sát" : "Ngưng hoạt động",
+        onConfirm: () => {
+          survey.status = willActivate ? "Hoạt động" : "Ngưng hoạt động";
+          survey.updatedBy = currentUser.username;
+          survey.updatedAt = new Date().toISOString();
+          showToast(willActivate ? "Đã bật khảo sát." : "Đã ngưng hoạt động khảo sát.");
+          render();
+        },
+      });
     }
-  }
-  if (action === "validate-survey") {
-    const errors = validateSurveyConfig(actionTarget.dataset.id);
-    showToast(errors.length ? `Validate chưa đạt: ${errors[0]}${errors.length > 1 ? ` (+${errors.length - 1} lỗi)` : ""}` : "Validate đạt. Khảo sát sẵn sàng publish.");
   }
   if (action === "publish-survey") {
     if (!hasPermission("SURVEY_PUBLISH")) {
-      showToast("Role hiện tại không có quyền publish khảo sát.");
+      showToast("Role hiện tại không có quyền duyệt khảo sát.");
       return;
     }
     const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
     const errors = validateSurveyConfig(actionTarget.dataset.id);
-    if (survey && !errors.length) {
-      survey.status = "Hoạt động";
-      survey.publishedBy = currentUser.username;
-      survey.publishedAt = new Date().toISOString();
-      showToast("Đã publish khảo sát sang trạng thái Hoạt động.");
-      render();
-    } else {
-      showToast(errors.length ? `Không thể publish: ${errors[0]}` : "Không tìm thấy khảo sát.");
-    }
+    if (!survey) return showToast("Không tìm thấy khảo sát.");
+    if (errors.length) return showToast(`Không thể duyệt: ${errors[0]}`);
+    openConfirmModal({
+      title: "Duyệt khảo sát?",
+      message: `Khảo sát "${survey.name}" sẽ chuyển sang trạng thái Hoạt động và có thể dùng để làm khảo sát.`,
+      confirmText: "Duyệt khảo sát",
+      onConfirm: () => {
+        survey.status = "Hoạt động";
+        survey.publishedBy = currentUser.username;
+        survey.publishedAt = new Date().toISOString();
+        survey.updatedBy = currentUser.username;
+        survey.updatedAt = new Date().toISOString();
+        showToast("Đã duyệt khảo sát sang trạng thái Hoạt động.");
+        render();
+      },
+    });
   }
   if (action === "archive-survey") {
     const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
     if (survey) {
-      survey.status = "Ngưng hoạt động";
-      survey.archivedBy = currentUser.username;
-      survey.archivedAt = new Date().toISOString();
-      showToast("Đã ngưng hoạt động khảo sát.");
-      render();
+      const willActivate = isSurveyPausedStatus(survey.status);
+      openConfirmModal({
+        title: willActivate ? "Cho khảo sát hoạt động trở lại?" : "Ngưng hoạt động khảo sát?",
+        message: willActivate
+          ? `Khảo sát "${survey.name}" sẽ chuyển lại trạng thái Hoạt động và có thể được chọn khi làm khảo sát.`
+          : `Khảo sát "${survey.name}" sẽ không còn được chọn khi làm khảo sát.`,
+        confirmText: willActivate ? "Hoạt động trở lại" : "Ngưng hoạt động",
+        onConfirm: () => {
+          survey.status = willActivate ? "Hoạt động" : "Ngưng hoạt động";
+          if (!willActivate) {
+            survey.archivedBy = currentUser.username;
+            survey.archivedAt = new Date().toISOString();
+          }
+          survey.updatedBy = currentUser.username;
+          survey.updatedAt = new Date().toISOString();
+          showToast(willActivate ? "Đã cho khảo sát hoạt động trở lại." : "Đã ngưng hoạt động khảo sát.");
+          render();
+        },
+      });
     }
   }
-  if (action === "duplicate-survey") duplicateSurvey(actionTarget.dataset.id);
+  if (action === "finish-survey") {
+    const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
+    if (survey) {
+      openConfirmModal({
+        title: "Kết thúc khảo sát?",
+        message: `Khảo sát "${survey.name}" sẽ chuyển sang trạng thái Kết thúc và không còn được duyệt/hoạt động lại.`,
+        confirmText: "Kết thúc khảo sát",
+        onConfirm: () => {
+          survey.status = "Kết thúc";
+          survey.finishedBy = currentUser.username;
+          survey.finishedAt = new Date().toISOString();
+          survey.updatedBy = currentUser.username;
+          survey.updatedAt = new Date().toISOString();
+          showToast("Đã kết thúc khảo sát.");
+          render();
+        },
+      });
+    }
+  }
   if (action === "delete-survey") {
     const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
+    if (isSurveyStatusActive(survey?.status)) {
+      showToast("Không thể xóa khảo sát đang hoạt động.");
+      return;
+    }
     openConfirmModal({
       title: "Xóa khảo sát?",
       message: `Khảo sát "${survey?.name || "đã chọn"}" cùng câu hỏi, điều kiện và phiên nhập liệu liên quan sẽ bị xóa khỏi prototype.`,
@@ -2930,9 +3426,19 @@ document.addEventListener("click", (event) => {
   if (action === "toggle-question") {
     const question = questions.find((item) => item.id === actionTarget.dataset.id);
     if (question) {
-      question.active = !question.active;
-      showToast(question.active ? "Đã bật câu hỏi." : "Đã tắt câu hỏi.");
-      render();
+      const willActivate = !question.active;
+      openConfirmModal({
+        title: willActivate ? "Bật câu hỏi?" : "Tắt câu hỏi?",
+        message: `${willActivate ? "Bật" : "Tắt"} trạng thái câu hỏi "${question.code}".`,
+        confirmText: willActivate ? "Bật câu hỏi" : "Tắt câu hỏi",
+        onConfirm: () => {
+          question.active = willActivate;
+          question.updatedBy = currentUser.username;
+          question.updatedAt = new Date().toISOString();
+          showToast(willActivate ? "Đã bật câu hỏi." : "Đã tắt câu hỏi.");
+          render();
+        },
+      });
     }
   }
   if (action === "delete-question") {
@@ -2967,27 +3473,44 @@ document.addEventListener("click", (event) => {
     if (row && list && list.querySelectorAll(".answer-option-row").length > 1) row.remove();
     else showToast("Cần giữ lại ít nhất một dòng/cột.");
   }
+  if (action === "add-rule-group") {
+    const form = document.querySelector("#ruleForm");
+    const list = document.querySelector("#ruleGroupList");
+    if (form && list) {
+      const sourceQuestion = selectedQuestions().find((question) => question.code === form.elements.source.value);
+      const groups = [...list.querySelectorAll("[data-rule-group]")].map((row) => {
+        const selectedTarget = row.querySelector('[name="target"]')?.value || "";
+        const isEndTarget = selectedTarget === END_SURVEY_TARGET;
+        return {
+          id: row.dataset.groupId,
+          operator: row.querySelector('[name="operator"]')?.value || "Bằng (=)",
+          matrixRow: row.querySelector('[name="matrixRow"]')?.value || "",
+          value: row.querySelector('[name="value"]')?.value || "",
+          action: isEndTarget ? "Kết thúc khảo sát" : row.querySelector('[name="action"]')?.value || "Hiển thị câu hỏi",
+          target: isEndTarget ? END_SURVEY_TARGET : selectedTarget,
+        };
+      });
+      groups.push({ ...ruleGroups({})[0], id: `g-${Date.now()}` });
+      list.innerHTML = renderRuleGroupRows(groups, sourceQuestion);
+    }
+  }
+  if (action === "remove-rule-group") {
+    const row = actionTarget.closest("[data-rule-group]");
+    const list = actionTarget.closest("#ruleGroupList");
+    if (row && list && list.querySelectorAll("[data-rule-group]").length > 1) row.remove();
+    else showToast("Cần giữ lại ít nhất một nhóm điều kiện.");
+  }
   if (action === "add-rule") openRuleModal(null, actionTarget.dataset.id);
   if (action === "view-rule") {
-    const rule = rules.find((item) => item.id === actionTarget.dataset.id);
-    if (rule) showToast(`${rule.code}: nếu ${rule.source}${rule.matrixRow ? ` / ${rule.matrixRow}` : ""} ${rule.operator} ${rule.value} thì ${rule.action} ${rule.target}`);
+    openRuleViewModal(actionTarget.dataset.id);
   }
-  if (action === "edit-rule") openRuleModal(actionTarget.dataset.id);
-  if (action === "toggle-rule") {
+  if (action === "edit-rule") {
     const rule = rules.find((item) => item.id === actionTarget.dataset.id);
-    if (rule) {
-      rule.active = !rule.active;
-      showToast(rule.active ? "Đã bật điều kiện." : "Đã tắt điều kiện.");
-      render();
+    if (rule?.active) {
+      showToast("Điều kiện đang hoạt động. Vui lòng tắt điều kiện trước khi sửa.");
+      return;
     }
-  }
-  if (action === "delete-rule") {
-    const index = rules.findIndex((item) => item.id === actionTarget.dataset.id);
-    if (index >= 0) {
-      rules.splice(index, 1);
-      showToast("Đã xóa điều kiện rẽ nhánh.");
-      render();
-    }
+    openRuleModal(actionTarget.dataset.id);
   }
   if (action === "check-rule-loop") {
     showToast("Prototype: chưa phát hiện vòng lặp trong điều kiện hiện tại.");
@@ -3022,11 +3545,10 @@ document.addEventListener("click", (event) => {
       const customer = selectedCustomer();
       const survey = selectedSurvey();
       const session = currentEntrySession();
-      if (customer && survey && session) {
-        session.status = "Hoàn thành";
-        session.completedAt = new Date().toISOString();
-        upsertReport(buildSurveyResult(session, customer, survey));
+      if (finishSurveySession(session, customer, survey)) {
         showToast("Rule đã kết thúc khảo sát sớm và ghi nhận báo cáo.");
+        renderReports();
+        return;
       }
     } else {
       goToEntryQuestion(nextIndex);
@@ -3060,12 +3582,10 @@ document.addEventListener("click", (event) => {
           startedAt: new Date().toISOString(),
         };
       if (!currentSession) sessions.unshift(session);
-      session.status = "Hoàn thành";
-      session.completedAt = new Date().toISOString();
-      upsertReport(buildSurveyResult(session, customer, survey));
+      finishSurveySession(session, customer, survey);
     }
     showToast(customer ? `Đã hoàn thành kiểm tra cho ${customer.name}.` : "Lượt kiểm tra mẫu đã được đánh dấu hoàn thành.");
-    render();
+    renderReports();
   }
 });
 
