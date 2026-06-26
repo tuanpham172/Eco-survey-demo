@@ -8,7 +8,6 @@ const state = {
   search: "",
   statusFilter: "all",
   customerSearch: "",
-  customerSurveyFilter: "all",
   reportSurveyFilter: "all",
   reportCustomerFilter: "",
   reportFrom: "",
@@ -969,7 +968,6 @@ function renderSurveys() {
 }
 
 function renderCustomers() {
-  const activeSurveyList = activeSurveys();
   const keyword = normalizedText(state.customerSearch);
   const visibleCustomers = customers.filter((customer) => {
     const haystack = normalizedText(`${customer.name} ${customer.code} ${customer.phone} ${customer.apartment}`);
@@ -982,22 +980,9 @@ function renderCustomers() {
       `<button class="btn secondary" type="button" data-action="reset-customer-context">${icon("check")} Bỏ chọn khách hàng</button>`,
     )}
     <section class="panel customer-filter-panel">
-      <div class="form-grid">
-        <div class="field">
-          <label for="customerSearch">Tìm khách hàng</label>
-          <input class="search" id="customerSearch" list="customerSuggestions" value="${escapeHtml(state.customerSearch)}" placeholder="Nhập tên, mã KH, SĐT, căn hộ..." autocomplete="off" />
-          <datalist id="customerSuggestions">
-            ${customers.map((customer) => `<option value="${escapeHtml(customer.name)}">${escapeHtml(customer.code)} · ${escapeHtml(customer.phone || "Chưa có SĐT")}</option>`).join("")}
-          </datalist>
-        </div>
-        <div class="field">
-          <label for="customerSurveyFilter">Khảo sát active</label>
-          <select class="select" id="customerSurveyFilter">
-            <option value="all" ${state.customerSurveyFilter === "all" ? "selected" : ""}>Tất cả khảo sát active</option>
-            ${activeSurveyList.map((survey) => `<option value="${escapeHtml(survey.id)}" ${state.customerSurveyFilter === survey.id ? "selected" : ""}>${escapeHtml(survey.name)} · ${escapeHtml(survey.code || "—")}</option>`).join("")}
-          </select>
-          <p class="item-meta">${activeSurveyList.length} khảo sát đang active có thể chọn khi làm khảo sát.</p>
-        </div>
+      <div class="field customer-search-field">
+        <label for="customerSearch">Tìm khách hàng</label>
+        <input class="search" id="customerSearch" value="${escapeHtml(state.customerSearch)}" placeholder="Nhập tên, mã KH, SĐT, căn hộ..." autocomplete="off" />
       </div>
     </section>
     <section class="panel table-panel">
@@ -1042,10 +1027,6 @@ function renderCustomers() {
 
   document.querySelector("#customerSearch")?.addEventListener("input", (event) => {
     state.customerSearch = event.target.value;
-    renderCustomers();
-  });
-  document.querySelector("#customerSurveyFilter")?.addEventListener("change", (event) => {
-    state.customerSurveyFilter = event.target.value;
     renderCustomers();
   });
 }
@@ -1312,30 +1293,10 @@ function openUserPermissionModal(userId) {
 
 function renderReports() {
   const visibleReports = filteredReports();
-  const completedCount = reports.length;
-  const uniqueCustomers = new Set(reports.map((report) => report.customerId || report.customerName).filter(Boolean)).size;
-  const uniqueSurveys = new Set(reports.map((report) => report.surveyId).filter(Boolean)).size;
   const surveyOptions = ["all", ...new Set(reports.map((report) => report.surveyId).filter(Boolean))];
 
   content.innerHTML = `
     ${renderHeader("Báo cáo", "Lọc, xem nhanh và export raw data kết quả khảo sát.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export CSV</button>`)}
-    <section class="metric-grid compact-metrics" aria-label="Chỉ số báo cáo">
-      <article class="metric-card">
-        <div class="metric-icon tone-green">${icon("check")}</div>
-        <strong>${completedCount}</strong>
-        <span>Kết quả khảo sát</span>
-      </article>
-      <article class="metric-card">
-        <div class="metric-icon tone-blue">${icon("user")}</div>
-        <strong>${uniqueCustomers}</strong>
-        <span>Khách hàng đã khảo sát</span>
-      </article>
-      <article class="metric-card">
-        <div class="metric-icon tone-violet">${icon("clipboard")}</div>
-        <strong>${uniqueSurveys}</strong>
-        <span>Mẫu khảo sát</span>
-      </article>
-    </section>
     <section class="panel report-filter-panel">
       <div class="form-grid four">
         <div class="field">
@@ -1409,20 +1370,6 @@ function renderReports() {
               )
               .join("")
           : `<section class="panel"><div class="empty-state">Chưa có kết quả phù hợp filter. Vào Khách hàng → Làm khảo sát → Hoàn thành kiểm tra để ghi nhận báo cáo.</div></section>`
-      }
-    </section>
-    <section class="panel">
-      <div class="panel-header">
-        <h2 class="panel-title">Audit export</h2>
-        <span class="item-meta">${exportAudits.length} lần export</span>
-      </div>
-      ${
-        exportAudits.length
-          ? exportAudits
-              .slice(0, 5)
-              .map((audit) => `<div class="survey-row"><div><h3 class="item-title">${escapeHtml(audit.id)} · ${escapeHtml(audit.format.toUpperCase())}</h3><div class="item-meta">${escapeHtml(audit.requestedBy)} · ${escapeHtml(formatDateTime(audit.requestedAt))} · ${audit.rowCount} dòng</div></div><span class="type-pill">RAW_DATA_EXPORT</span></div>`)
-              .join("")
-          : `<div class="empty-state">Chưa có lịch sử export.</div>`
       }
     </section>
   `;
@@ -2660,7 +2607,7 @@ function openCustomerSurveyModal(customerId) {
   const availableSurveys = activeSurveys();
   const surveyOptions = (items) =>
     items
-      .map((survey) => `<option value="${survey.id}" ${state.customerSurveyFilter === survey.id ? "selected" : ""}>${escapeHtml(survey.name)} · ${escapeHtml(survey.code || "—")} · ${escapeHtml(survey.department || "Chưa có phòng ban")}</option>`)
+      .map((survey) => `<option value="${survey.id}">${escapeHtml(survey.name)} · ${escapeHtml(survey.code || "—")} · ${escapeHtml(survey.department || "Chưa có phòng ban")}</option>`)
       .join("");
 
   openModal(`

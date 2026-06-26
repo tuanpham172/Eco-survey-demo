@@ -483,7 +483,7 @@ svg {
 .survey-table-head,
 .survey-table-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1.6fr) 150px 150px 180px 140px;
+  grid-template-columns: minmax(280px, 1.5fr) 90px 120px minmax(210px, 0.8fr) minmax(320px, auto);
   align-items: center;
 }
 
@@ -583,6 +583,11 @@ svg {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
+  min-width: 0;
+}
+
+.row-actions {
+  flex-wrap: nowrap;
 }
 
 .icon-action {
@@ -629,7 +634,7 @@ svg {
 
 .toolbar {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
@@ -652,6 +657,15 @@ svg {
   color: var(--text);
   padding: 0 13px;
   box-shadow: var(--shadow-sm);
+}
+
+.compact-select {
+  width: min(240px, 100%);
+  flex: 0 0 240px;
+}
+
+.customer-search-field .search {
+  width: min(460px, 100%);
 }
 
 .tabs {
