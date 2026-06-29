@@ -27,6 +27,7 @@ const currentUser = {
 const SURVEY_STATUSES = ["Khởi tạo", "Chờ duyệt", "Hoạt động", "Ngưng hoạt động", "Hết hạn", "Kết thúc", "Đang hoạt động", "Tạm dừng"];
 const MATRIX_QUESTIONS_ENABLED = true;
 const MATRIX_MULTI_TYPE = "Ma trận nhiều lựa chọn";
+const MATRIX_RATING_TYPE = "Đánh giá ma trận";
 
 const roleCatalog = [
   { code: "SYSTEM_ADMIN", name: "Quản trị hệ thống", permissions: ["SURVEY_CREATE", "SURVEY_EDIT", "SURVEY_PUBLISH", "QUESTION_EDIT", "RULE_EDIT", "SESSION_START", "SESSION_SUBMIT", "RESPONSE_VIEW_LIST", "RAW_DATA_EXPORT", "AUDIT_VIEW"] },
@@ -156,28 +157,57 @@ const toast = document.querySelector("#toast");
 let pendingConfirm = null;
 let draggedQuestionId = null;
 const STORAGE_KEY = "ecosurvey-portal-prototype-v1";
+const SUPABASE_STATE_TABLE = "ecosurvey_app_state";
+const SUPABASE_STATE_ID = "main";
 const END_SURVEY_TARGET = "__END_SURVEY__";
+const supabaseSettings = window.ECOSURVEY_SUPABASE || {};
+const supabaseClient =
+  window.supabase && supabaseSettings.url && supabaseSettings.anonKey
+    ? window.supabase.createClient(supabaseSettings.url, supabaseSettings.anonKey)
+    : null;
+let supabaseSaveTimer = null;
+let lastSupabaseSaveError = "";
 
 function replaceArray(target, value) {
   target.splice(0, target.length, ...(Array.isArray(value) ? value : []));
+}
+
+function prototypeSnapshot() {
+  return {
+    surveys,
+    questions,
+    rules,
+    sessions,
+    reports,
+    exportAudits,
+    users,
+    customers,
+    answers: state.answers,
+    selectedSurveyId: state.selectedSurveyId,
+    selectedCustomerId: state.selectedCustomerId,
+  };
+}
+
+function applyPrototypeSnapshot(data) {
+  if (!data || typeof data !== "object") return;
+  replaceArray(surveys, data.surveys);
+  replaceArray(questions, data.questions);
+  replaceArray(rules, data.rules);
+  replaceArray(sessions, data.sessions);
+  replaceArray(reports, data.reports);
+  replaceArray(exportAudits, data.exportAudits);
+  replaceArray(users, data.users);
+  replaceArray(customers, data.customers);
+  state.answers = data.answers && typeof data.answers === "object" ? data.answers : {};
+  state.selectedSurveyId = surveys.some((survey) => survey.id === data.selectedSurveyId) ? data.selectedSurveyId : surveys[0]?.id || null;
+  state.selectedCustomerId = customers.some((customer) => customer.id === data.selectedCustomerId) ? data.selectedCustomerId : null;
 }
 
 function loadPrototypeData() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
-    const data = JSON.parse(raw);
-    replaceArray(surveys, data.surveys);
-    replaceArray(questions, data.questions);
-    replaceArray(rules, data.rules);
-    replaceArray(sessions, data.sessions);
-    replaceArray(reports, data.reports);
-    replaceArray(exportAudits, data.exportAudits);
-    replaceArray(users, data.users);
-    replaceArray(customers, data.customers);
-    state.answers = data.answers && typeof data.answers === "object" ? data.answers : {};
-    state.selectedSurveyId = surveys.some((survey) => survey.id === data.selectedSurveyId) ? data.selectedSurveyId : surveys[0]?.id || null;
-    state.selectedCustomerId = customers.some((customer) => customer.id === data.selectedCustomerId) ? data.selectedCustomerId : null;
+    applyPrototypeSnapshot(JSON.parse(raw));
   } catch (error) {
     console.warn("Không thể nạp dữ liệu prototype đã lưu.", error);
   }
@@ -185,25 +215,75 @@ function loadPrototypeData() {
 
 function persistPrototypeData() {
   try {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        surveys,
-        questions,
-        rules,
-        sessions,
-        reports,
-        exportAudits,
-        users,
-        customers,
-        answers: state.answers,
-        selectedSurveyId: state.selectedSurveyId,
-        selectedCustomerId: state.selectedCustomerId,
-      }),
-    );
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(prototypeSnapshot()));
+    queueSupabaseSave();
   } catch (error) {
     console.warn("Không thể lưu dữ liệu prototype.", error);
   }
+}
+
+function saveLocalPrototypeDataOnly() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(prototypeSnapshot()));
+  } catch (error) {
+    console.warn("Khong the cap nhat cache local.", error);
+  }
+}
+
+function queueSupabaseSave() {
+  if (!supabaseClient) return;
+  window.clearTimeout(supabaseSaveTimer);
+  supabaseSaveTimer = window.setTimeout(() => {
+    savePrototypeDataToSupabase();
+  }, 350);
+}
+
+async function savePrototypeDataToSupabase() {
+  if (!supabaseClient) return false;
+  const { error } = await supabaseClient
+    .from(SUPABASE_STATE_TABLE)
+    .upsert(
+      {
+        id: SUPABASE_STATE_ID,
+        data: prototypeSnapshot(),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "id" },
+    );
+  if (error) {
+    const message = error.message || "Khong the luu Supabase.";
+    if (message !== lastSupabaseSaveError) {
+      console.warn("Khong the luu du lieu len Supabase.", error);
+      showToast("Chua luu duoc len Supabase. App van giu cache local.");
+      lastSupabaseSaveError = message;
+    }
+    return false;
+  }
+  lastSupabaseSaveError = "";
+  return true;
+}
+
+async function loadPrototypeDataFromSupabase() {
+  if (!supabaseClient) return false;
+  const { data, error } = await supabaseClient
+    .from(SUPABASE_STATE_TABLE)
+    .select("data")
+    .eq("id", SUPABASE_STATE_ID)
+    .maybeSingle();
+  if (error) {
+    console.warn("Khong the nap du lieu tu Supabase.", error);
+    showToast("Chua ket noi duoc Supabase. Dang dung du lieu local.");
+    return false;
+  }
+  if (!data?.data) {
+    await savePrototypeDataToSupabase();
+    return false;
+  }
+  applyPrototypeSnapshot(data.data);
+  ensureDefaultUsers();
+  ensureDefaultCustomers();
+  saveLocalPrototypeDataOnly();
+  return true;
 }
 
 function ensureDefaultCustomers() {
@@ -266,6 +346,14 @@ function currentEntrySession() {
   const customer = selectedCustomer();
   if (!customer) return null;
   return sessions.find((session) => session.customerId === customer.id && session.surveyId === state.selectedSurveyId && session.status !== "Hoàn thành") || null;
+}
+
+function isQuestionActive(question) {
+  return question?.active !== false;
+}
+
+function isRuleActive(rule) {
+  return rule?.active !== false;
 }
 
 function activeStatusLabel(isActive) {
@@ -440,6 +528,34 @@ function selectedRules() {
     .sort((a, b) => a.priority - b.priority);
 }
 
+function entryQuestions() {
+  const survey = selectedSurvey();
+  if (!survey) return [];
+  const session = currentEntrySession();
+  if (session?.questionIds?.length) {
+    return session.questionIds
+      .map((id) => questions.find((question) => question.id === id))
+      .filter(Boolean)
+      .sort((a, b) => a.order - b.order);
+  }
+  if (!isSurveyStatusActive(survey.status)) return [];
+  return questionsForSurvey(survey.id).filter(isQuestionActive);
+}
+
+function entryRules() {
+  const survey = selectedSurvey();
+  if (!survey) return [];
+  const session = currentEntrySession();
+  if (session?.ruleIds?.length) {
+    return session.ruleIds
+      .map((id) => rules.find((rule) => rule.id === id))
+      .filter(Boolean)
+      .sort((a, b) => a.priority - b.priority);
+  }
+  if (!isSurveyStatusActive(survey.status)) return [];
+  return rules.filter((rule) => rule.surveyId === survey.id && isRuleActive(rule)).sort((a, b) => a.priority - b.priority);
+}
+
 function ruleGroups(rule) {
   const groups = Array.isArray(rule?.groups) ? rule.groups : [];
   if (groups.length) {
@@ -447,6 +563,7 @@ function ruleGroups(rule) {
       id: group.id || `group-${index + 1}`,
       operator: group.operator || rule.operator || "Bằng (=)",
       matrixRow: group.matrixRow || "",
+      matrixScope: group.matrixScope || "row",
       value: group.value ?? "",
       action: group.action || rule.action || "Hiển thị câu hỏi",
       target: group.target || "",
@@ -457,6 +574,7 @@ function ruleGroups(rule) {
       id: "group-1",
       operator: rule?.operator || "Bằng (=)",
       matrixRow: rule?.matrixRow || "",
+      matrixScope: rule?.matrixScope || "row",
       value: rule?.value ?? "",
       action: rule?.action || "Hiển thị câu hỏi",
       target: rule?.target || "",
@@ -492,6 +610,7 @@ function normalizedText(value) {
 }
 
 function answerMatchesRule(answer, rule) {
+  if (rule.action === "Kết thúc khảo sát" && !String(rule.value ?? "").trim()) return true;
   if (Array.isArray(answer)) {
     if (normalizedText(rule.operator).includes("khong chua")) {
       return !answer.some((item) => normalizedText(item).includes(normalizedText(rule.value)));
@@ -515,14 +634,30 @@ function answerMatchesRule(answer, rule) {
   return left === right;
 }
 
+function matrixRatingAnswerMatchesRule(answer, group) {
+  const matrixAnswer = answer && typeof answer === "object" && !Array.isArray(answer) ? answer : {};
+  const values = Object.values(matrixAnswer).filter((value) => value !== undefined && value !== null && value !== "");
+  const scope = group.matrixScope || "row";
+  if (scope === "any") return values.some((value) => answerMatchesRule(value, group));
+  if (scope === "all") return values.length > 0 && values.every((value) => answerMatchesRule(value, group));
+  return group.matrixRow ? answerMatchesRule(matrixAnswer[group.matrixRow], group) : false;
+}
+
 function matchedRuleForQuestion(question) {
   if (!question) return null;
   const answer = state.answers[question.code];
-  if (answer === undefined || answer === "" || (Array.isArray(answer) && !answer.length)) return null;
   const matches = [];
-  for (const rule of selectedRules()) {
+  for (const rule of entryRules()) {
     if (!rule.active || rule.source !== question.code) continue;
     for (const group of ruleGroups(rule)) {
+      if (group.action === "Kết thúc khảo sát" && !String(group.value ?? "").trim()) {
+        matches.push({ ...rule, ...group, matchedGroup: group, parentRule: rule });
+        continue;
+      }
+      if (isMatrixRatingType(question.type)) {
+        if (matrixRatingAnswerMatchesRule(answer, group)) matches.push({ ...rule, ...group, matchedGroup: group, parentRule: rule });
+        continue;
+      }
       const comparableAnswer = isMatrixQuestionType(question.type) ? answer?.[group.matrixRow] : answer;
       if (comparableAnswer === undefined || comparableAnswer === "" || (Array.isArray(comparableAnswer) && !comparableAnswer.length)) continue;
       if (answerMatchesRule(comparableAnswer, group)) matches.push({ ...rule, ...group, matchedGroup: group, parentRule: rule });
@@ -531,17 +666,18 @@ function matchedRuleForQuestion(question) {
   return matches.find((match) => match.action === "Kết thúc khảo sát") || matches[0] || null;
 }
 
-function questionIndexByCode(code, surveyQs = selectedQuestions()) {
+function questionIndexByCode(code, surveyQs = entryQuestions()) {
   return surveyQs.findIndex((question) => question.code === code);
 }
 
 function nextEntryQuestionIndex() {
-  const surveyQs = selectedQuestions();
+  const surveyQs = entryQuestions();
   const current = surveyQs[state.selectedQuestionIndex] || surveyQs[0];
   const matchedRule = matchedRuleForQuestion(current);
   if (matchedRule?.action === "Kết thúc khảo sát") return -1;
   const targetIndex = matchedRule ? questionIndexByCode(matchedRule.target, surveyQs) : -1;
   if (targetIndex >= 0 && ["Hiển thị câu hỏi", "Bỏ qua câu hỏi"].includes(matchedRule.action)) return targetIndex;
+  if (state.selectedQuestionIndex >= surveyQs.length - 1) return -1;
   return Math.min(state.selectedQuestionIndex + 1, Math.max(surveyQs.length - 1, 0));
 }
 
@@ -549,11 +685,23 @@ function goToEntryQuestion(nextIndex) {
   if (nextIndex === state.selectedQuestionIndex) return;
   state.entryHistory.push(state.selectedQuestionIndex);
   state.selectedQuestionIndex = nextIndex;
-  const question = selectedQuestions()[nextIndex];
+  const question = entryQuestions()[nextIndex];
   const session = currentEntrySession();
   if (question && session) {
     session.visitedCodes = [...new Set([...(session.visitedCodes || []), question.code])];
   }
+}
+
+function finishCurrentEntrySession(successMessage = "Đã hoàn thành khảo sát và ghi nhận báo cáo.") {
+  const customer = selectedCustomer();
+  const survey = selectedSurvey();
+  const session = currentEntrySession();
+  if (finishSurveySession(session, customer, survey)) {
+    showToast(successMessage);
+    renderReports();
+    return true;
+  }
+  return false;
 }
 
 function escapeHtml(value) {
@@ -625,7 +773,9 @@ function formatAnswerValue(value) {
 }
 
 function buildSurveyResult(session, customer, survey) {
-  const surveyQuestions = questionsForSurvey(survey.id);
+  const surveyQuestions = session?.questionIds?.length
+    ? session.questionIds.map((id) => questions.find((question) => question.id === id)).filter(Boolean).sort((a, b) => a.order - b.order)
+    : questionsForSurvey(survey.id).filter(isQuestionActive);
   const visitedCodes = new Set(session.visitedCodes || []);
   return {
     id: `RP${Date.now()}`,
@@ -720,6 +870,13 @@ function validateQuestionAnswer(question) {
   const answer = state.answers[question.code];
   if (isMatrixQuestionType(question.type)) {
     const matrixAnswer = answer && typeof answer === "object" && !Array.isArray(answer) ? answer : {};
+    if (isMatrixRatingType(question.type)) {
+      if (question.required) {
+        const missingRow = matrixRowsForQuestion(question).find((row) => !matrixAnswer[row]);
+        if (missingRow) return `Vui lòng đánh giá tiêu chí "${missingRow}".`;
+      }
+      return "";
+    }
     const requiredMode = question.matrixRequiredMode || "each_column_min_one";
     if (question.required && requiredMode === "each_column_min_one") {
       const missingColumn = matrixColumnSelections(question, matrixAnswer).find((item) => item.rows.length < Number(question.minColumnSelections || 1));
@@ -733,7 +890,7 @@ function validateQuestionAnswer(question) {
 }
 
 function validateCurrentQuestionBeforeMove() {
-  const question = selectedQuestions()[state.selectedQuestionIndex];
+  const question = entryQuestions()[state.selectedQuestionIndex];
   const error = validateQuestionAnswer(question);
   if (error) {
     showToast(error);
@@ -764,6 +921,19 @@ function exportAnswerRows(report, answer) {
   }
   const question = questions.find((item) => item.id === answer.questionId) || answer;
   const matrixAnswer = answer.answer && typeof answer.answer === "object" && !Array.isArray(answer.answer) ? answer.answer : {};
+  if (isMatrixRatingType(answer.type)) {
+    return matrixRowsForQuestion(question).map((row) => ({
+      questionId: answer.questionId,
+      questionCode: `${answer.code}_${row}`,
+      questionOrder: answer.order,
+      questionType: answer.type,
+      questionText: answer.text,
+      matrixRow: row,
+      matrixColumn: "",
+      answerStatus: matrixAnswer[row] ? "answered" : "not_answered",
+      answerValue: matrixAnswer[row] || "",
+    }));
+  }
   return matrixRowsForQuestion(question).flatMap((row) =>
     matrixColumnsForQuestion(question).map((column) => {
       const selected = Array.isArray(matrixAnswer[row]) && matrixAnswer[row].includes(column);
@@ -812,7 +982,8 @@ function exportReportsCsv() {
     }))),
   );
   const header = ["surveyId", "surveyCode", "surveyName", "versionNo", "sessionId", "salesforceContactId", "customerCode", "customerName", "answeredByUsername", "startedAt", "completedAt", "questionId", "questionCode", "questionOrder", "questionType", "questionText", "matrixRow", "matrixColumn", "answerStatus", "answerValue"];
-  const csv = [header.join(","), ...rows.map((row) => header.map((key) => csvCell(row[key])).join(","))].join("\n");
+  const headerLabels = ["ID khảo sát", "Mã khảo sát", "Tên khảo sát", "Phiên bản", "Mã phiên khảo sát", "Salesforce Contact ID", "Mã khách hàng", "Tên khách hàng", "User thực hiện", "Thời gian bắt đầu", "Thời gian hoàn thành", "ID câu hỏi", "Mã câu hỏi", "Thứ tự câu hỏi", "Loại câu hỏi", "Nội dung câu hỏi", "Dòng ma trận/Tiêu chí", "Cột ma trận", "Trạng thái trả lời", "Giá trị trả lời"];
+  const csv = [headerLabels.map(csvCell).join(","), header.join(","), ...rows.map((row) => header.map((key) => csvCell(row[key])).join(","))].join("\n");
   const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
@@ -841,11 +1012,15 @@ function answerCount(question) {
 }
 
 function isMatrixQuestionType(type) {
-  return MATRIX_QUESTIONS_ENABLED && type === MATRIX_MULTI_TYPE;
+  return MATRIX_QUESTIONS_ENABLED && [MATRIX_MULTI_TYPE, MATRIX_RATING_TYPE].includes(type);
 }
 
 function isMatrixMultipleType(type) {
   return type === MATRIX_MULTI_TYPE;
+}
+
+function isMatrixRatingType(type) {
+  return type === MATRIX_RATING_TYPE;
 }
 
 function questionSupportsOptions(type) {
@@ -860,9 +1035,9 @@ function normalizedQuestionType(type) {
 function operatorOptionsForQuestion(question) {
   const type = normalizedQuestionType(question?.type || "");
   if (type === "Chọn một đáp án") return ["Bằng (=)", "Khác (!=)"];
-  if (type === "Chọn nhiều đáp án" || isMatrixQuestionType(type)) return ["Có chứa", "Không chứa"];
+  if (type === "Chọn nhiều đáp án" || type === MATRIX_MULTI_TYPE) return ["Có chứa", "Không chứa"];
   if (type === "Văn bản") return ["Có chứa", "Không chứa", "Bằng (=)", "Khác (!=)"];
-  if (["Số", "Ngày", "Đánh giá"].includes(type)) return ["Bằng (=)", "Khác (!=)", "Lớn hơn", "Lớn hơn hoặc bằng", "Nhỏ hơn", "Nhỏ hơn hoặc bằng"];
+  if (["Số", "Ngày", "Đánh giá", MATRIX_RATING_TYPE].includes(type)) return ["Bằng (=)", "Khác (!=)", "Lớn hơn", "Lớn hơn hoặc bằng", "Nhỏ hơn", "Nhỏ hơn hoặc bằng"];
   return ["Bằng (=)", "Khác (!=)"];
 }
 
@@ -880,16 +1055,21 @@ function defaultMatrixRows() {
   return ["Ăn một mình", "Ăn cùng gia đình/bạn bè", "Khi đi làm/văn phòng", "Cuối tuần", "Khi có khuyến mãi"];
 }
 
-function defaultMatrixColumns() {
+function defaultMatrixRatingRows() {
+  return ["Giá món ăn", "Phí giao hàng", "Tốc độ giao hàng", "Chất lượng món ăn", "Độ đúng món/đúng đơn", "Thái độ tài xế", "Ưu đãi/khuyến mãi", "Dễ sử dụng app"];
+}
+
+function defaultMatrixColumns(type = "") {
+  if (type === MATRIX_RATING_TYPE) return ["1", "2", "3", "4", "5"];
   return ["Cơm/món chính", "Đồ uống", "Đồ ăn vặt"];
 }
 
 function matrixRowsForQuestion(question = {}) {
-  return Array.isArray(question.matrixRows) && question.matrixRows.length ? question.matrixRows : defaultMatrixRows();
+  return Array.isArray(question.matrixRows) && question.matrixRows.length ? question.matrixRows : isMatrixRatingType(question.type) ? defaultMatrixRatingRows() : defaultMatrixRows();
 }
 
 function matrixColumnsForQuestion(question = {}) {
-  return Array.isArray(question.matrixColumns) && question.matrixColumns.length ? question.matrixColumns : defaultMatrixColumns();
+  return Array.isArray(question.matrixColumns) && question.matrixColumns.length ? question.matrixColumns : defaultMatrixColumns(question.type);
 }
 
 function renderSurveyInfoBlock(survey, questionCount, ruleCount) {
@@ -926,6 +1106,10 @@ function renderHeader(title, subtitle, action = "") {
       <div>${action}</div>
     </header>
   `;
+}
+
+function renderAgentScriptHint(question) {
+  return question?.agentScript ? `<p class="question-guide-hint">${escapeHtml(question.agentScript)}</p>` : "";
 }
 
 function render() {
@@ -1557,7 +1741,7 @@ function renderReports() {
               )
               .join("")}
           `
-          : `<div class="empty-state">Chưa có kết quả phù hợp filter. Vào Khách hàng → Làm khảo sát → Hoàn thành kiểm tra để ghi nhận báo cáo.</div>`
+          : `<div class="empty-state">Chưa có kết quả phù hợp filter. Vào Khách hàng → Làm khảo sát và đi hết luồng câu hỏi để ghi nhận báo cáo.</div>`
       }
     </section>
   `;
@@ -1852,10 +2036,11 @@ function renderSurveyDetail() {
   }
   const surveyQs = selectedQuestions();
   const surveyRs = selectedRules();
+  const surveyEntryQs = entryQuestions();
   const tabContent = {
     questions: renderQuestionsTab(surveyQs),
     branching: renderBranchingTab(surveyRs),
-    entry: renderEntryTab(surveyQs),
+    entry: renderEntryTab(surveyEntryQs),
   }[state.detailTab || "questions"];
 
   content.innerHTML = `
@@ -2030,7 +2215,6 @@ function renderEntryTab(surveyQs) {
           <h2 class="panel-title">Kiểm tra câu hỏi</h2>
           <p class="page-subtitle">${customer ? `Khách hàng: ${customer.name} · ${customer.apartment || "Chưa có căn hộ"}` : `${surveySessions.length} lượt kiểm tra của khảo sát này`}</p>
         </div>
-        <button class="btn primary" type="button" data-action="complete-session">Hoàn thành kiểm tra</button>
       </div>
       <section class="entry-layout embedded-entry">
         <aside class="entry-list" aria-label="Danh sách câu hỏi">
@@ -2055,7 +2239,7 @@ function renderEntryTab(surveyQs) {
               </div>
               <div style="padding: 20px">
                 <h3 class="question-title">${escapeHtml(current.text)}</h3>
-                ${current.guideText ? `<p class="question-guide-hint">${escapeHtml(current.guideText)}</p>` : ""}
+                ${renderAgentScriptHint(current)}
                 ${renderAnswerControl(current)}
                 <div class="form-footer">
                   <button class="btn secondary" type="button" data-action="prev-question">Trước</button>
@@ -2153,7 +2337,7 @@ function renderEntry() {
     `;
     return;
   }
-  const surveyQs = selectedQuestions();
+  const surveyQs = entryQuestions();
   const current = surveyQs[state.selectedQuestionIndex] || surveyQs[0];
 
   content.innerHTML = `
@@ -2164,7 +2348,6 @@ function renderEntry() {
           ${surveys.map((item) => `<option value="${item.id}" ${item.id === survey.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
         </select>
       </div>
-      <button class="btn primary" type="button" data-action="complete-session">Hoàn thành kiểm tra</button>
     </div>
     <section class="entry-layout">
       <aside class="entry-list" aria-label="Danh sách câu hỏi">
@@ -2189,6 +2372,7 @@ function renderEntry() {
             </div>
             <div style="padding: 20px">
               <h3 class="item-title" style="font-size: 18px">${escapeHtml(current.text)}</h3>
+              ${renderAgentScriptHint(current)}
               ${renderAnswerControl(current)}
               <div class="form-footer">
                 <button class="btn secondary" type="button" data-action="prev-question">Trước</button>
@@ -2218,11 +2402,12 @@ function renderAnswerControl(question) {
     const rows = matrixRowsForQuestion(question);
     const columns = matrixColumnsForQuestion(question);
     const isMultiple = isMatrixMultipleType(type);
+    const isRating = isMatrixRatingType(type);
     return `
-      <div class="matrix-answer" role="group" aria-label="${escapeHtml(question.text)}">
+      <div class="matrix-answer ${isRating ? "matrix-rating-answer" : ""}" role="group" aria-label="${escapeHtml(question.text)}">
         <div class="matrix-table" style="--matrix-columns: ${columns.length}">
           <div class="matrix-row matrix-head">
-            <div class="matrix-label-cell">Tình huống</div>
+            <div class="matrix-label-cell">${isRating ? "Tiêu chí" : "Tình huống"}</div>
             ${columns.map((column) => `<div class="matrix-choice-head">${escapeHtml(column)}</div>`).join("")}
           </div>
           ${rows
@@ -2418,12 +2603,12 @@ function updateAnswerOptionsVisibility() {
   }
   matrixPanel.hidden = !isMatrixQuestionType(type);
   if (isMatrixQuestionType(type) && !matrixPanel.querySelector("[name='matrixRowValue']")) {
-    matrixPanel.querySelector(".matrix-row-config-list").innerHTML = renderMatrixConfigRows(defaultMatrixRows(), "matrixRowValue", "Tiêu chí");
-    matrixPanel.querySelector(".matrix-column-config-list").innerHTML = renderMatrixConfigRows(defaultMatrixColumns(), "matrixColumnValue", "Lựa chọn");
+    matrixPanel.querySelector(".matrix-row-config-list").innerHTML = renderMatrixConfigRows(isMatrixRatingType(type) ? defaultMatrixRatingRows() : defaultMatrixRows(), "matrixRowValue", "Tiêu chí");
+    matrixPanel.querySelector(".matrix-column-config-list").innerHTML = renderMatrixConfigRows(defaultMatrixColumns(type), "matrixColumnValue", isMatrixRatingType(type) ? "Điểm" : "Lựa chọn");
   }
   const matrixRequiredBody = form.querySelector("#matrixRequiredConfigBody");
   if (matrixRequiredBody) {
-    if (!isMatrixQuestionType(type)) matrixRequiredBody.innerHTML = "";
+    if (!isMatrixQuestionType(type) || isMatrixRatingType(type)) matrixRequiredBody.innerHTML = "";
     else if (!matrixRequiredBody.querySelector("[name='matrixRequiredMode']")) matrixRequiredBody.innerHTML = renderMatrixRequiredConfig();
   }
   valuePanel.hidden = !questionValueConfigVisible(type);
@@ -2460,7 +2645,7 @@ function openQuestionModal(questionId = null) {
           <div class="field">
             <label for="questionType">Loại câu hỏi</label>
             <select class="select" id="questionType" name="type">
-              ${["Chọn một đáp án", "Chọn nhiều đáp án", MATRIX_MULTI_TYPE, "Văn bản", "Số", "Đánh giá", "Ngày"]
+              ${["Chọn một đáp án", "Chọn nhiều đáp án", MATRIX_MULTI_TYPE, MATRIX_RATING_TYPE, "Văn bản", "Số", "Đánh giá", "Ngày"]
                 .map((type) => `<option ${type === selectedType ? "selected" : ""}>${type}</option>`)
                 .join("")}
             </select>
@@ -2490,7 +2675,7 @@ function openQuestionModal(questionId = null) {
           <div class="block-heading compact">
             <div>
               <p class="block-eyebrow">Ma trận</p>
-              <h3 class="block-title">Dòng tiêu chí và cột lựa chọn</h3>
+              <h3 class="block-title">${isMatrixRatingType(selectedType) ? "Tiêu chí và thang điểm" : "Dòng tiêu chí và cột lựa chọn"}</h3>
             </div>
           </div>
           <div class="matrix-config-grid">
@@ -2505,16 +2690,16 @@ function openQuestionModal(questionId = null) {
             </div>
             <div>
               <div class="matrix-config-head">
-                <h4>Cột lựa chọn</h4>
+                <h4>${isMatrixRatingType(selectedType) ? "Thang điểm" : "Cột lựa chọn"}</h4>
                 <button class="btn secondary compact-action" type="button" data-action="add-matrix-column">${icon("plus")} Thêm cột</button>
               </div>
               <div class="matrix-column-config-list">
-                ${renderMatrixConfigRows(matrixColumnValues, "matrixColumnValue", "Lựa chọn")}
+                ${renderMatrixConfigRows(matrixColumnValues, "matrixColumnValue", isMatrixRatingType(selectedType) ? "Điểm" : "Lựa chọn")}
               </div>
             </div>
           </div>
           <div id="matrixRequiredConfigBody">
-            ${isMatrixQuestionType(selectedType) ? renderMatrixRequiredConfig(editingQuestion || {}) : ""}
+            ${isMatrixQuestionType(selectedType) && !isMatrixRatingType(selectedType) ? renderMatrixRequiredConfig(editingQuestion || {}) : ""}
           </div>
         </section>
         <section class="answer-options-panel" id="questionValueConfigPanel" ${questionValueConfigVisible(selectedType) ? "" : "hidden"}>
@@ -2529,7 +2714,7 @@ function openQuestionModal(questionId = null) {
           </div>
         </section>
         <div class="check-row">
-          <label><input type="checkbox" name="required" ${editingQuestion?.required ? "checked" : ""} /> Bắt buộc trả lời</label>
+          <label><input type="checkbox" name="required" ${isEditing ? (editingQuestion?.required ? "checked" : "") : "checked"} /> Bắt buộc trả lời</label>
           <label><input type="checkbox" name="active" ${editingQuestion?.active === false ? "" : "checked"} /> Hoạt động</label>
         </div>
         <div class="form-footer">
@@ -2557,10 +2742,10 @@ function openQuestionModal(questionId = null) {
       text: data.text.trim(),
       required: form.elements.required.checked,
       options: questionSupportsOptions(type) ? options : [],
-      matrixRows: isMatrixQuestionType(type) ? (matrixRows.length ? matrixRows : defaultMatrixRows()) : [],
-      matrixColumns: isMatrixQuestionType(type) ? (matrixColumns.length ? matrixColumns : defaultMatrixColumns()) : [],
-      matrixRequiredMode: isMatrixQuestionType(type) ? data.matrixRequiredMode || "each_column_min_one" : "",
-      minColumnSelections: isMatrixQuestionType(type) ? Math.max(Number(data.minColumnSelections) || 1, 1) : "",
+      matrixRows: isMatrixQuestionType(type) ? (matrixRows.length ? matrixRows : isMatrixRatingType(type) ? defaultMatrixRatingRows() : defaultMatrixRows()) : [],
+      matrixColumns: isMatrixQuestionType(type) ? (matrixColumns.length ? matrixColumns : defaultMatrixColumns(type)) : [],
+      matrixRequiredMode: isMatrixQuestionType(type) && !isMatrixRatingType(type) ? data.matrixRequiredMode || "each_column_min_one" : "",
+      minColumnSelections: isMatrixQuestionType(type) && !isMatrixRatingType(type) ? Math.max(Number(data.minColumnSelections) || 1, 1) : "",
       agentScript: data.agentScript.trim(),
       guideText: editingQuestion?.guideText || "",
       placeholder: editingQuestion?.placeholder || "",
@@ -2602,18 +2787,20 @@ function comparisonValueOptions(question, selectedValue = "") {
   `;
 }
 
-function comparisonValueControl(question, selectedValue = "", fieldName = "value", fieldId = "ruleValue") {
+function comparisonValueControl(question, selectedValue = "", fieldName = "value", fieldId = "ruleValue", required = true) {
+  const requiredAttr = required ? "required" : "";
   if (question?.type === "Số") {
-    return `<input class="input" id="${fieldId}" name="${fieldName}" type="number" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị số" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" type="number" value="${escapeHtml(selectedValue)}" placeholder="${required ? "Nhập giá trị số" : "Có thể bỏ trống để kết thúc luôn"}" ${requiredAttr} />`;
   }
   if (question?.type === "Ngày") {
-    return `<input class="input" id="${fieldId}" name="${fieldName}" type="date" value="${escapeHtml(selectedValue)}" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" type="date" value="${escapeHtml(selectedValue)}" ${requiredAttr} />`;
   }
   if (!questionSupportsOptions(question?.type) && !isMatrixQuestionType(question?.type)) {
-    return `<input class="input" id="${fieldId}" name="${fieldName}" value="${escapeHtml(selectedValue)}" placeholder="Nhập giá trị so sánh" required />`;
+    return `<input class="input" id="${fieldId}" name="${fieldName}" value="${escapeHtml(selectedValue)}" placeholder="${required ? "Nhập giá trị so sánh" : "Có thể bỏ trống để kết thúc luôn"}" ${requiredAttr} />`;
   }
   return `
-    <select class="select" id="${fieldId}" name="${fieldName}" required>
+    <select class="select" id="${fieldId}" name="${fieldName}" ${requiredAttr}>
+      ${required ? "" : `<option value="" ${selectedValue ? "" : "selected"}>-- Không cần giá trị --</option>`}
       ${comparisonValueOptions(question, selectedValue)}
     </select>
   `;
@@ -2631,6 +2818,26 @@ function matrixRuleRowControl(question, selectedRow = "", fieldName = "matrixRow
       }
     </select>
   `;
+}
+
+function matrixRatingScopeControl(selectedScope = "row", fieldName = "matrixScope", fieldId = "ruleMatrixScope") {
+  const scopes = [
+    { value: "row", label: "Một tiêu chí cụ thể" },
+    { value: "any", label: "Bất kỳ tiêu chí nào" },
+    { value: "all", label: "Tất cả tiêu chí" },
+  ];
+  return `
+    <label for="${fieldId}">Phạm vi kiểm tra</label>
+    <select class="select" id="${fieldId}" name="${fieldName}">
+      ${scopes.map((scope) => `<option value="${scope.value}" ${scope.value === selectedScope ? "selected" : ""}>${scope.label}</option>`).join("")}
+    </select>
+  `;
+}
+
+function matrixScopeLabel(scope = "row") {
+  if (scope === "any") return "Bất kỳ tiêu chí nào";
+  if (scope === "all") return "Tất cả tiêu chí";
+  return "Một tiêu chí cụ thể";
 }
 
 function renderRuleGroupRows(groups = [], sourceQuestion = null) {
@@ -2651,6 +2858,7 @@ function renderRuleGroupRows(groups = [], sourceQuestion = null) {
       const isEndAction = selectedAction === "Kết thúc khảo sát";
       const selectedTarget = isEndAction ? "" : group.target;
       const selectedOperator = operatorOptions.includes(group.operator) ? group.operator : defaultOperatorForQuestion(sourceQuestion);
+      const selectedScope = isMatrixRatingType(sourceQuestion?.type) ? group.matrixScope || "row" : "row";
       return `
         <article class="rule-group-card" data-rule-group data-group-id="${escapeHtml(group.id || `group-${index + 1}`)}">
           <div class="rule-group-header">
@@ -2668,13 +2876,19 @@ function renderRuleGroupRows(groups = [], sourceQuestion = null) {
               </select>
             </div>
             ${
-              isMatrixQuestionType(sourceQuestion?.type)
+              isMatrixRatingType(sourceQuestion?.type)
+                ? `<div class="field rule-matrix-scope-field">${matrixRatingScopeControl(selectedScope, "matrixScope", `${groupId}MatrixScope`)}</div>`
+                : ""
+            }
+            ${
+              isMatrixQuestionType(sourceQuestion?.type) && (!isMatrixRatingType(sourceQuestion?.type) || selectedScope === "row")
                 ? `<div class="field rule-matrix-row-field">${matrixRuleRowControl(sourceQuestion, group.matrixRow || "", "matrixRow", `${groupId}MatrixRow`)}</div>`
                 : ""
             }
             <div class="field rule-value-field">
               <label for="${groupId}Value">Giá trị so sánh</label>
-              ${comparisonValueControl(sourceQuestion, group.value || "", "value", `${groupId}Value`)}
+              ${comparisonValueControl(sourceQuestion, group.value || "", "value", `${groupId}Value`, !isEndAction)}
+              ${isEndAction ? `<p class="field-hint">Bỏ trống nếu muốn kết thúc khảo sát ngay khi tới câu hỏi nguồn.</p>` : ""}
             </div>
             <div class="field">
               <label for="${groupId}Action">Loại hành động</label>
@@ -2709,6 +2923,7 @@ function updateRuleGroupFields() {
     const selectedOperator = row.querySelector('[name="operator"]')?.value || defaultOperatorForQuestion(sourceQuestion);
     return {
       operator: validOperators.includes(selectedOperator) ? selectedOperator : defaultOperatorForQuestion(sourceQuestion),
+      matrixScope: isMatrixRatingType(sourceQuestion?.type) ? row.querySelector('[name="matrixScope"]')?.value || "row" : "row",
       matrixRow: row.querySelector('[name="matrixRow"]')?.value || "",
       value: row.querySelector('[name="value"]')?.value || "",
       action: selectedAction,
@@ -2735,7 +2950,12 @@ function renderReadOnlyRuleGroupRows(rule, sourceQuestion) {
               <input class="input" value="${escapeHtml(group.operator || "—")}" readonly />
             </div>
             ${
-              isMatrixQuestionType(sourceQuestion?.type)
+              isMatrixRatingType(sourceQuestion?.type)
+                ? `<div class="field"><label>Phạm vi kiểm tra</label><input class="input" value="${escapeHtml(matrixScopeLabel(group.matrixScope))}" readonly /></div>`
+                : ""
+            }
+            ${
+              isMatrixQuestionType(sourceQuestion?.type) && (!isMatrixRatingType(sourceQuestion?.type) || group.matrixScope === "row")
                 ? `<div class="field"><label>Dòng ma trận</label><input class="input" value="${escapeHtml(group.matrixRow || "—")}" readonly /></div>`
                 : ""
             }
@@ -2900,23 +3120,34 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
         const selectedTarget = row.querySelector('[name="target"]')?.value || "";
         const isEndAction = selectedAction === "Kết thúc khảo sát";
         const selectedOperator = row.querySelector('[name="operator"]')?.value || defaultOperatorForQuestion(sourceQuestion);
+        const matrixScope = isMatrixRatingType(sourceQuestion?.type) ? row.querySelector('[name="matrixScope"]')?.value || "row" : "row";
         return {
           id: row.dataset.groupId || `g-${Date.now()}-${index}`,
           operator: validOperators.includes(selectedOperator) ? selectedOperator : defaultOperatorForQuestion(sourceQuestion),
-          matrixRow: isMatrixQuestionType(sourceQuestion?.type) ? row.querySelector('[name="matrixRow"]')?.value || "" : "",
+          matrixScope,
+          matrixRow: isMatrixQuestionType(sourceQuestion?.type) && (!isMatrixRatingType(sourceQuestion?.type) || matrixScope === "row") ? row.querySelector('[name="matrixRow"]')?.value || "" : "",
           value: (row.querySelector('[name="value"]')?.value || "").trim(),
           action: selectedAction,
           target: isEndAction ? "" : selectedTarget,
         };
       })
-      .filter((group) => group.value || group.target);
+      .filter((group) => group.value || group.target || group.action === "Kết thúc khảo sát");
     if (!groups.length) {
       showToast("Cần cấu hình ít nhất một nhóm điều kiện.");
       return;
     }
-    const invalidGroupIndex = groups.findIndex((group) => !group.value || (group.action !== "Kết thúc khảo sát" && !group.target));
+    const invalidGroupIndex = groups.findIndex((group) => {
+      if (group.action === "Kết thúc khảo sát" && !group.value) return false;
+      return !group.value || (isMatrixRatingType(sourceQuestion?.type) && group.matrixScope === "row" && !group.matrixRow) || (group.action !== "Kết thúc khảo sát" && !group.target);
+    });
     if (invalidGroupIndex >= 0) {
       showToast(`Nhóm ${invalidGroupIndex + 1} cần đủ giá trị so sánh và câu hỏi đích.`);
+      return;
+    }
+    const priority = Number(data.priority) || nextOrder;
+    const duplicatedPriorityRule = rules.find((rule) => rule.surveyId === selectedSurvey().id && rule.id !== editingRule?.id && Number(rule.priority) === priority);
+    if (duplicatedPriorityRule) {
+      showToast(`Độ ưu tiên ${priority} đã được dùng bởi điều kiện "${duplicatedPriorityRule.name || duplicatedPriorityRule.code}".`);
       return;
     }
     const firstGroup = groups[0];
@@ -2929,10 +3160,11 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
       groups,
       operator: firstGroup.operator,
       matrixRow: firstGroup.matrixRow,
+      matrixScope: firstGroup.matrixScope,
       value: firstGroup.value,
       action: firstGroup.action,
       target: firstGroup.target,
-      priority: Number(data.priority) || nextOrder,
+      priority,
       active: form.elements.active.checked,
     };
     if (isEditing) Object.assign(editingRule, payload, { updatedBy: currentUser.username, updatedAt: new Date().toISOString() });
@@ -2944,7 +3176,7 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
 
   document.querySelector("#ruleSource").addEventListener("change", () => updateRuleGroupFields());
   document.querySelector("#ruleGroupList")?.addEventListener("change", (event) => {
-    if (event.target?.matches('[name="action"]')) updateRuleGroupFields();
+    if (event.target?.matches('[name="action"], [name="matrixScope"]')) updateRuleGroupFields();
   });
 }
 
@@ -3025,6 +3257,8 @@ function openCustomerSurveyModal(customerId) {
     state.selectedQuestionIndex = 0;
     state.entryHistory = [];
     resetDraftAnswersForSurvey(survey.id);
+    const sessionQuestions = questionsForSurvey(survey.id).filter(isQuestionActive);
+    const sessionRules = rules.filter((rule) => rule.surveyId === survey.id && isRuleActive(rule)).sort((a, b) => a.priority - b.priority);
     sessions.unshift({
       id: `S${String(sessions.length + 1).padStart(3, "0")}`,
       surveyId: survey.id,
@@ -3032,7 +3266,9 @@ function openCustomerSurveyModal(customerId) {
       customerId: customer.id,
       status: "Đang kiểm tra",
       answeredByUsername: currentUser.username,
-      visitedCodes: [questionsForSurvey(survey.id)[0]?.code].filter(Boolean),
+      questionIds: sessionQuestions.map((question) => question.id),
+      ruleIds: sessionRules.map((rule) => rule.id),
+      visitedCodes: [sessionQuestions[0]?.code].filter(Boolean),
       startedAt: new Date().toISOString(),
       completedAt: "",
     });
@@ -3473,10 +3709,12 @@ document.addEventListener("click", (event) => {
         const selectedTarget = row.querySelector('[name="target"]')?.value || "";
         const isEndAction = selectedAction === "Kết thúc khảo sát";
         const selectedOperator = row.querySelector('[name="operator"]')?.value || defaultOperatorForQuestion(sourceQuestion);
+        const matrixScope = isMatrixRatingType(sourceQuestion?.type) ? row.querySelector('[name="matrixScope"]')?.value || "row" : "row";
         return {
           id: row.dataset.groupId,
           operator: validOperators.includes(selectedOperator) ? selectedOperator : defaultOperatorForQuestion(sourceQuestion),
-          matrixRow: row.querySelector('[name="matrixRow"]')?.value || "",
+          matrixScope,
+          matrixRow: (!isMatrixRatingType(sourceQuestion?.type) || matrixScope === "row") ? row.querySelector('[name="matrixRow"]')?.value || "" : "",
           value: row.querySelector('[name="value"]')?.value || "",
           action: selectedAction,
           target: isEndAction ? "" : selectedTarget,
@@ -3532,16 +3770,21 @@ document.addEventListener("click", (event) => {
   }
   if (action === "next-question") {
     if (!validateCurrentQuestionBeforeMove()) return;
+    const current = entryQuestions()[state.selectedQuestionIndex];
+    const matchedRule = matchedRuleForQuestion(current);
+    if (matchedRule?.action === "Kết thúc khảo sát") {
+      openConfirmModal({
+        title: "Kết thúc khảo sát?",
+        message: `Điều kiện rẽ nhánh "${matchedRule.parentRule?.name || matchedRule.code || "đã cấu hình"}" sẽ kết thúc khảo sát tại câu ${current?.code || "hiện tại"}.`,
+        confirmText: "Kết thúc khảo sát",
+        onConfirm: () => finishCurrentEntrySession("Đã xác nhận kết thúc khảo sát và ghi nhận báo cáo."),
+      });
+      return;
+    }
     const nextIndex = nextEntryQuestionIndex();
     if (nextIndex < 0) {
-      const customer = selectedCustomer();
-      const survey = selectedSurvey();
-      const session = currentEntrySession();
-      if (finishSurveySession(session, customer, survey)) {
-        showToast("Rule đã kết thúc khảo sát sớm và ghi nhận báo cáo.");
-        renderReports();
-        return;
-      }
+      finishCurrentEntrySession("Đã hoàn thành khảo sát và ghi nhận báo cáo.");
+      return;
     } else {
       goToEntryQuestion(nextIndex);
     }
@@ -3670,4 +3913,15 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && modalRoot.innerHTML) closeModal();
 });
 
-render();
+async function initializeApp() {
+  render();
+  const loadedFromSupabase = await loadPrototypeDataFromSupabase();
+  if (loadedFromSupabase) {
+    render();
+    showToast("Đã đồng bộ dữ liệu từ Supabase.");
+  } else if (supabaseClient) {
+    showToast("Đã sẵn sàng lưu dữ liệu demo lên Supabase.");
+  }
+}
+
+initializeApp();
