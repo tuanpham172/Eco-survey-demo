@@ -245,6 +245,7 @@ svg {
 .workspace {
   min-width: 0;
   background: transparent;
+  overflow: hidden;
 }
 
 .workspace:focus {
@@ -252,8 +253,13 @@ svg {
 }
 
 .content {
-  width: min(100%, 1360px);
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 100dvh;
+  box-sizing: border-box;
   padding: 24px 24px 40px;
+  overflow-y: auto;
 }
 
 .page-head {
@@ -303,6 +309,14 @@ svg {
 .btn:hover {
   border-color: var(--line-strong);
   box-shadow: var(--shadow-md);
+}
+
+.btn:disabled,
+.compact-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  box-shadow: none;
+  filter: grayscale(0.25);
 }
 
 .btn.primary {
@@ -506,13 +520,22 @@ svg {
 }
 
 .table-panel {
-  overflow-x: auto;
+  overflow-x: scroll;
+  overflow-y: auto;
+  scrollbar-gutter: stable both-edges;
+}
+
+.content > .table-panel:last-child,
+.content > .block-panel:last-child,
+.content > .report-table-panel:last-child {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .customer-table-head,
 .customer-table-row {
-  grid-template-columns: minmax(260px, 1.4fr) 170px 190px;
-  min-width: 0;
+  grid-template-columns: minmax(320px, 1fr) minmax(180px, 0.45fr) minmax(220px, 0.5fr);
+  min-width: 960px;
 }
 
 .user-table-head,
@@ -752,12 +775,12 @@ svg {
   display: flex;
   flex-wrap: wrap;
   gap: 18px;
-  margin: 12px 0 22px;
+  margin: 8px 0 14px;
   border-bottom: 1px solid var(--line);
 }
 
 .tab-button {
-  min-height: 44px;
+  min-height: 38px;
   padding: 0 2px;
   border: 0;
   border-bottom: 2px solid transparent;
@@ -790,12 +813,12 @@ svg {
 }
 
 .info-block {
-  margin-bottom: 18px;
+  margin-bottom: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
-  padding: 20px;
+  padding: 14px 16px;
 }
 
 .block-heading {
@@ -803,7 +826,7 @@ svg {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 10px;
 }
 
 .block-heading.compact {
@@ -821,22 +844,22 @@ svg {
 .block-title {
   margin: 0;
   color: var(--text);
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
 }
 
 .info-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(7, minmax(120px, 1fr));
+  gap: 8px;
 }
 
 .info-grid div {
-  min-height: 62px;
+  min-height: 48px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: #fbfdff;
-  padding: 10px 12px;
+  padding: 8px 10px;
 }
 
 .info-grid span {
@@ -847,14 +870,14 @@ svg {
 
 .info-grid strong {
   display: block;
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--text);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
 }
 
 .info-description {
-  margin: 14px 0 0;
+  margin: 8px 0 0;
   color: #475569;
 }
 
@@ -997,7 +1020,10 @@ svg {
   gap: 12px;
   padding: 16px;
   background: #fbfdff;
-  overflow-x: auto;
+  max-height: calc(100dvh - 310px);
+  overflow: scroll;
+  align-content: start;
+  scrollbar-gutter: stable both-edges;
 }
 
 .rule-list {
@@ -1005,6 +1031,10 @@ svg {
   gap: 12px;
   padding: 16px;
   background: #fbfdff;
+  max-height: calc(100dvh - 310px);
+  overflow: scroll;
+  align-content: start;
+  scrollbar-gutter: stable both-edges;
 }
 
 .question-card,
@@ -1026,6 +1056,9 @@ svg {
 
 .question-table-head,
 .rule-table-head {
+  position: sticky;
+  top: 0;
+  z-index: 4;
   display: grid;
   gap: 12px;
   align-items: center;
@@ -1384,9 +1417,112 @@ svg {
     background 160ms var(--ease);
 }
 
+.answer-option span:nth-child(2) {
+  min-width: 0;
+  flex: 1;
+}
+
+.answer-option.is-disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.top-n-counter {
+  border: 1px solid #bfdbfe;
+  border-radius: var(--radius-sm);
+  background: #eff6ff;
+  color: #1d4ed8;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.top-n-rank-badge {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .other-answer-input {
   margin: -6px 0 8px 34px;
   width: calc(100% - 34px);
+}
+
+.ranking-answer {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.ranking-hint {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 13px;
+  font-style: italic;
+}
+
+.ranking-item {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 48px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  padding: 8px 10px;
+  cursor: grab;
+  transition:
+    border-color 160ms var(--ease),
+    box-shadow 160ms var(--ease),
+    transform 160ms var(--ease);
+}
+
+.ranking-item.is-dragging {
+  opacity: 0.56;
+  cursor: grabbing;
+  transform: scale(0.99);
+}
+
+.ranking-item.is-drop-target {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1);
+}
+
+.ranking-position {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.ranking-label {
+  min-width: 0;
+  color: var(--text);
+  font-weight: 650;
+}
+
+.ranking-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.ranking-drag-handle {
+  color: var(--muted);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -2px;
+  cursor: grab;
+  user-select: none;
 }
 
 .answer-option:hover {
@@ -1576,7 +1712,8 @@ svg {
 }
 
 .report-table-scroll {
-  overflow-x: auto;
+  overflow-x: scroll;
+  scrollbar-gutter: stable both-edges;
 }
 
 .report-table-head,
@@ -1867,6 +2004,45 @@ svg {
   color: var(--secondary);
   font-size: 14px;
   font-weight: 650;
+}
+
+.table-link-cell,
+.question-title-button {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.table-link-cell {
+  padding: 0;
+  font-weight: 750;
+}
+
+.question-title-button {
+  padding: 0;
+  font-weight: 750;
+  line-height: 1.45;
+}
+
+.table-link-cell:hover,
+.question-title-button:hover {
+  color: var(--primary);
+  text-decoration: underline;
+}
+
+.readonly-form .input:disabled,
+.readonly-form .textarea:disabled {
+  color: var(--text);
+  background: #f8fafc;
+  opacity: 1;
+  cursor: default;
+}
+
+.readonly-form .answer-option-row .input:disabled {
+  color: var(--text);
 }
 
 .toast {

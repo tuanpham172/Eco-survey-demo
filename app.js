@@ -27,6 +27,9 @@ const currentUser = {
 
 const SURVEY_STATUSES = ["Khởi tạo", "Chờ duyệt", "Hoạt động", "Ngưng hoạt động", "Hết hạn", "Kết thúc", "Đang hoạt động", "Tạm dừng"];
 const MATRIX_QUESTIONS_ENABLED = true;
+const RANKING_TYPE = "Sắp xếp thứ tự ưu tiên";
+const RANKING_POSITION_OPERATOR = "Lựa chọn đứng vị trí bằng N";
+const TOP_N_TYPE = "Chọn Top N";
 const MATRIX_MULTI_TYPE = "Ma trận nhiều lựa chọn";
 const MATRIX_RATING_TYPE = "Đánh giá ma trận";
 
@@ -157,6 +160,7 @@ const modalRoot = document.querySelector("#modalRoot");
 const toast = document.querySelector("#toast");
 let pendingConfirm = null;
 let draggedQuestionId = null;
+let draggedRanking = null;
 const STORAGE_KEY = "ecosurvey-portal-prototype-v1";
 const SUPABASE_STATE_TABLE = "ecosurvey_app_state";
 const SUPABASE_STATE_ID = "main";
@@ -403,6 +407,11 @@ function isSurveyPausedStatus(status) {
   return normalizedText(status).includes("ngung");
 }
 
+function isSurveyInactiveStatus(status) {
+  const key = normalizedText(status);
+  return key.includes("khong hoat dong") || key.includes("ngung") || key.includes("tam dung");
+}
+
 function isSurveyDraftStatus(status) {
   const key = normalizedText(status);
   return key === "khoi tao" || key === "cho duyet";
@@ -495,6 +504,40 @@ function validateSurveyConfig(surveyId) {
   return errors;
 }
 
+function validateSurveyConfig(surveyId) {
+  const survey = surveys.find((item) => item.id === surveyId);
+  const surveyQuestions = questionsForSurvey(surveyId);
+  const surveyRules = rules.filter((rule) => rule.surveyId === surveyId);
+  const errors = [];
+  if (!survey) return ["Không tìm thấy khảo sát."];
+  if (!survey.name?.trim()) errors.push("Thiếu tên khảo sát.");
+  if (!survey.code?.trim()) errors.push("Thiếu mã khảo sát.");
+  if (!survey.channel?.trim()) errors.push("Thiếu kênh trả lời.");
+  if (!survey.startDate) errors.push("Thiếu ngày bắt đầu hiệu lực.");
+  if (!survey.endDate) errors.push("Thiếu ngày kết thúc hiệu lực.");
+  if (survey.startDate && survey.endDate && new Date(survey.startDate) > new Date(survey.endDate)) errors.push("Ngày bắt đầu không được lớn hơn ngày kết thúc.");
+  if (!surveyQuestions.length) errors.push("Khảo sát chưa có câu hỏi.");
+  surveyQuestions.forEach((question) => {
+    if (!question.code?.trim()) errors.push(`Câu hỏi ${question.order} thiếu mã câu hỏi.`);
+    if (!question.text?.trim()) errors.push(`${question.code || "Câu hỏi"} thiếu nội dung.`);
+    if (questionSupportsOptions(question.type) && !question.options?.length) errors.push(`${question.code} là câu hỏi lựa chọn nhưng chưa có đáp án.`);
+    if (isMatrixQuestionType(question.type) && (!matrixRowsForQuestion(question).length || !matrixColumnsForQuestion(question).length)) errors.push(`${question.code} là câu hỏi ma trận nhưng thiếu dòng/cột.`);
+  });
+  const activeCodes = new Set(surveyQuestions.filter((question) => question.active !== false).map((question) => question.code));
+  surveyRules.forEach((rule) => {
+    if (!activeCodes.has(rule.source)) errors.push(`${rule.code} tham chiếu câu hỏi nguồn không Hoạt động/không tồn tại.`);
+    ruleGroups(rule).forEach((group, index) => {
+      const groupLabel = `${rule.code} / Nhóm ${index + 1}`;
+      const isEndAction = normalizedText(group.action) === normalizedText("Kết thúc khảo sát");
+      if (!isEndAction && !group.value?.toString().trim()) errors.push(`${groupLabel} thiếu giá trị so sánh.`);
+      if (!isEndAction && !group.target) errors.push(`${groupLabel} thiếu câu hỏi đích.`);
+      if (group.target && !activeCodes.has(group.target)) errors.push(`${groupLabel} tham chiếu câu hỏi đích không Hoạt động/không tồn tại.`);
+      if (rule.source && group.target && rule.source === group.target) errors.push(`${groupLabel} không được tự trỏ cùng một câu hỏi.`);
+    });
+  });
+  return errors;
+}
+
 function questionsForSurvey(surveyId) {
   return questions
     .filter((question) => question.surveyId === surveyId)
@@ -540,7 +583,14 @@ function entryQuestions() {
       .filter(Boolean)
       .sort((a, b) => a.order - b.order);
   }
+  if (state.view === "surveyDetail" && state.detailTab === "entry" && !session) return questionsForSurvey(survey.id).filter(isQuestionActive);
   if (!isSurveyStatusActive(survey.status)) return [];
+  return questionsForSurvey(survey.id).filter(isQuestionActive);
+}
+
+function previewQuestions() {
+  const survey = selectedSurvey();
+  if (!survey) return [];
   return questionsForSurvey(survey.id).filter(isQuestionActive);
 }
 
@@ -554,6 +604,7 @@ function entryRules() {
       .filter(Boolean)
       .sort((a, b) => a.priority - b.priority);
   }
+  if (state.view === "surveyDetail" && state.detailTab === "entry" && !session) return rules.filter((rule) => rule.surveyId === survey.id && isRuleActive(rule)).sort((a, b) => a.priority - b.priority);
   if (!isSurveyStatusActive(survey.status)) return [];
   return rules.filter((rule) => rule.surveyId === survey.id && isRuleActive(rule)).sort((a, b) => a.priority - b.priority);
 }
@@ -613,6 +664,11 @@ function normalizedText(value) {
 
 function answerMatchesRule(answer, rule) {
   if (rule.action === "Kết thúc khảo sát" && !String(rule.value ?? "").trim()) return true;
+  if (Array.isArray(answer) && normalizedText(rule.operator) === normalizedText(RANKING_POSITION_OPERATOR)) {
+    const [expectedValue = "", expectedPosition = ""] = String(rule.value || "").split("@").map((item) => item.trim());
+    const rankIndex = Number(expectedPosition) - 1;
+    return rankIndex >= 0 && normalizedText(answer[rankIndex]) === normalizedText(expectedValue);
+  }
   if (Array.isArray(answer)) {
     if (normalizedText(rule.operator).includes("khong chua")) {
       return !answer.some((item) => normalizedText(item).includes(normalizedText(rule.value)));
@@ -733,6 +789,8 @@ function icon(name) {
     trash: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 7h14M10 11v5M14 11v5M9 7l1-2h4l1 2M7 7l1 12h8l1-12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     copy: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 8h10v10H8V8Z" stroke="currentColor" stroke-width="1.8"/><path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
     branch: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 6v5a4 4 0 0 0 4 4h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M7 18v-7a4 4 0 0 1 4-4h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="m15 4 3 3-3 3M15 12l3 3-3 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    "chevron-up": '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 14 5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    "chevron-down": '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 10 5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   };
   return icons[name] || "";
 }
@@ -794,6 +852,25 @@ function answerForReport(question) {
 
 function formatAnswerValue(value) {
   if (Array.isArray(value)) return value.length ? value.join(", ") : "Chưa trả lời";
+  if (value && typeof value === "object") {
+    const rows = Object.entries(value).map(([row, rowValue]) => `${row}: ${formatAnswerValue(rowValue)}`);
+    return rows.length ? rows.join(" | ") : "Chưa trả lời";
+  }
+  return value === undefined || value === null || value === "" ? "Chưa trả lời" : String(value);
+}
+
+function answerForReport(question) {
+  if (normalizedQuestionType(question.type) === RANKING_TYPE) return rankingAnswerForQuestion(question);
+  const value = cloneAnswer(state.answers[question.code]);
+  if (!answerHasOther(question, value)) return value;
+  const otherText = otherAnswerText(question);
+  const formattedOther = otherText ? `${OTHER_OPTION_LABEL} - ${otherText}` : OTHER_OPTION_LABEL;
+  if (Array.isArray(value)) return value.map((item) => (isOtherOption(item) ? formattedOther : item));
+  return isOtherOption(value) ? formattedOther : value;
+}
+
+function formatAnswerValue(value) {
+  if (Array.isArray(value)) return formatRankingAnswer(value);
   if (value && typeof value === "object") {
     const rows = Object.entries(value).map(([row, rowValue]) => `${row}: ${formatAnswerValue(rowValue)}`);
     return rows.length ? rows.join(" | ") : "Chưa trả lời";
@@ -919,7 +996,23 @@ function validateQuestionAnswer(question) {
     if (question.required && answerStatus(matrixAnswer) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
     return "";
   }
-  if (question.required && answerStatus(answer) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
+  if (normalizedQuestionType(question.type) === RANKING_TYPE && !Array.isArray(answer)) {
+    state.answers[question.code] = rankingAnswerForQuestion(question);
+    persistPrototypeData();
+  }
+  if (isTopNQuestion(question.type)) {
+    const values = Array.isArray(state.answers[question.code]) ? state.answers[question.code] : [];
+    const limit = topNLimit(question);
+    if (topNMode(question) === "exact" && values.length !== limit) return `Vui lòng chọn đúng ${limit} đáp án cho câu ${question.code}.`;
+    if (topNMode(question) === "max" && values.length > limit) return `Câu ${question.code} chỉ được chọn tối đa ${limit} đáp án.`;
+  }
+  if (isTopNQuestion(question.type)) {
+    const values = Array.isArray(state.answers[question.code]) ? state.answers[question.code] : [];
+    const limit = topNLimit(question);
+    if (topNMode(question) === "exact" && values.length !== limit) return `Vui lòng chọn đúng ${limit} đáp án cho câu ${question.code}.`;
+    if (topNMode(question) === "max" && values.length > limit) return `Câu ${question.code} chỉ được chọn tối đa ${limit} đáp án.`;
+  }
+  if (question.required && answerStatus(state.answers[question.code]) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
   return "";
 }
 
@@ -942,7 +1035,17 @@ function validateQuestionAnswer(question) {
     if (question.required && answerStatus(matrixAnswer) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
     return "";
   }
-  if (question.required && answerStatus(answer) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
+  if (normalizedQuestionType(question.type) === RANKING_TYPE && !Array.isArray(answer)) {
+    state.answers[question.code] = rankingAnswerForQuestion(question);
+    persistPrototypeData();
+  }
+  if (question.required && answerStatus(state.answers[question.code]) !== "answered") return `Vui lòng trả lời câu ${question.code}.`;
+  if (isTopNQuestion(question.type)) {
+    const values = Array.isArray(state.answers[question.code]) ? state.answers[question.code] : [];
+    const limit = topNLimit(question);
+    if (topNMode(question) === "exact" && values.length !== limit) return `Vui lòng chọn đúng ${limit} đáp án cho câu ${question.code}.`;
+    if (topNMode(question) === "max" && values.length > limit) return `Câu ${question.code} chỉ được chọn tối đa ${limit} đáp án.`;
+  }
   if (answerHasOther(question, answer) && !otherAnswerText(question)) return `Vui lòng nhập nội dung Khác cho câu ${question.code}.`;
   return "";
 }
@@ -955,6 +1058,15 @@ function validateCurrentQuestionBeforeMove() {
     return false;
   }
   return true;
+}
+
+function formatAnswerValue(value) {
+  if (Array.isArray(value)) return value.length ? value.join(", ") : "Chưa trả lời";
+  if (value && typeof value === "object") {
+    const rows = Object.entries(value).map(([row, rowValue]) => `${row}: ${formatAnswerValue(rowValue)}`);
+    return rows.length ? rows.join(" | ") : "Chưa trả lời";
+  }
+  return value === undefined || value === null || value === "" ? "Chưa trả lời" : String(value);
 }
 
 function csvCell(value) {
@@ -973,7 +1085,7 @@ function exportAnswerRows(report, answer) {
         matrixRow: "",
         matrixColumn: "",
         answerStatus: answer.status || answerStatus(answer.answer),
-        answerValue: formatAnswerValue(answer.answer),
+        answerValue: answer.type === RANKING_TYPE ? formatRankingAnswer(answer.answer) : formatAnswerValue(answer.answer),
       },
     ];
   }
@@ -1065,6 +1177,124 @@ function exportReportsCsv() {
   renderReports();
 }
 
+function exportReportsCsv() {
+  if (!hasPermission("RAW_DATA_EXPORT")) {
+    showToast("User hiện tại không có quyền export báo cáo.");
+    return;
+  }
+  const rows = filteredReports().map((report) => ({
+    customerCode: report.customerCode || "",
+    customerName: report.customerName || "",
+    surveyCode: report.surveyCode || "",
+    surveyName: report.surveyName || "",
+    answeredByUsername: displayUserName(report.answeredByUsername),
+    startedAt: formatDateTime(report.startedAt),
+    completedAt: formatDateTime(report.completedAt),
+  }));
+  const header = ["customerCode", "customerName", "surveyCode", "surveyName", "answeredByUsername", "startedAt", "completedAt"];
+  const headerLabels = ["Mã khách", "Tên khách hàng", "Mã khảo sát", "Tên khảo sát", "Agent", "Bắt đầu", "Hoàn thành"];
+  const exportedAt = new Date().toISOString().slice(0, 10);
+  let exportFormat = "xlsx";
+  if (window.XLSX) {
+    const worksheetRows = [headerLabels, header, ...rows.map((row) => header.map((key) => row[key] ?? ""))];
+    const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Bao cao");
+    XLSX.writeFile(workbook, `ecosurvey-filtered-results-${exportedAt}.xlsx`);
+  } else {
+    exportFormat = "csv";
+    const csv = [headerLabels.map(csvCell).join(","), header.join(","), ...rows.map((row) => header.map((key) => csvCell(row[key])).join(","))].join("\n");
+    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `ecosurvey-filtered-results-${exportedAt}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+  exportAudits.unshift({
+    id: `EX${Date.now()}`,
+    requestedBy: currentUser.username,
+    requestedAt: new Date().toISOString(),
+    format: exportFormat,
+    rowCount: rows.length,
+    filters: {
+      surveyId: state.reportSurveyFilter,
+      customer: state.reportCustomerFilter,
+      completedFrom: state.reportFrom,
+      completedTo: state.reportTo,
+    },
+  });
+  showToast(`Đã export ${rows.length} dòng theo danh sách đang lọc.`);
+  renderReports();
+}
+
+function exportReportsCsv() {
+  if (!hasPermission("RAW_DATA_EXPORT")) {
+    showToast("User hiện tại không có quyền export báo cáo.");
+    return;
+  }
+  const sourceReports = filteredReports();
+  const rows = sourceReports.flatMap((report) =>
+    report.answers.flatMap((answer) => exportAnswerRows(report, answer).map((answerRow) => ({
+      surveyId: report.surveyId,
+      surveyCode: report.surveyCode,
+      surveyName: report.surveyName,
+      versionNo: report.surveyVersion,
+      sessionId: report.sessionId,
+      salesforceContactId: report.salesforceContactId || report.customerId,
+      customerCode: report.customerCode,
+      customerName: report.customerName,
+      answeredByUsername: report.answeredByUsername || currentUser.username,
+      startedAt: report.startedAt,
+      completedAt: report.completedAt,
+      questionId: answerRow.questionId,
+      questionCode: answerRow.questionCode,
+      questionOrder: answerRow.questionOrder,
+      questionType: answerRow.questionType,
+      questionText: answerRow.questionText,
+      matrixRow: answerRow.matrixRow,
+      matrixColumn: answerRow.matrixColumn,
+      answerStatus: answerRow.answerStatus,
+      answerValue: answerRow.answerValue,
+    }))),
+  );
+  const header = ["surveyId", "surveyCode", "surveyName", "versionNo", "sessionId", "salesforceContactId", "customerCode", "customerName", "answeredByUsername", "startedAt", "completedAt", "questionId", "questionCode", "questionOrder", "questionType", "questionText", "matrixRow", "matrixColumn", "answerStatus", "answerValue"];
+  const headerLabels = ["ID khảo sát", "Mã khảo sát", "Tên khảo sát", "Phiên bản", "Mã phiên khảo sát", "Salesforce Contact ID", "Mã khách hàng", "Tên khách hàng", "User thực hiện", "Thời gian bắt đầu", "Thời gian hoàn thành", "ID câu hỏi", "Mã câu hỏi", "Thứ tự câu hỏi", "Loại câu hỏi", "Nội dung câu hỏi", "Dòng ma trận/Tiêu chí", "Cột ma trận", "Trạng thái trả lời", "Giá trị trả lời"];
+  const exportedAt = new Date().toISOString().slice(0, 10);
+  let exportFormat = "xlsx";
+  if (window.XLSX) {
+    const worksheetRows = [headerLabels, header, ...rows.map((row) => header.map((key) => row[key] ?? ""))];
+    const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Raw data");
+    XLSX.writeFile(workbook, `ecosurvey-raw-data-${exportedAt}.xlsx`);
+  } else {
+    exportFormat = "csv";
+    const csv = [headerLabels.map(csvCell).join(","), header.join(","), ...rows.map((row) => header.map((key) => csvCell(row[key])).join(","))].join("\n");
+    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `ecosurvey-raw-data-${exportedAt}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+  exportAudits.unshift({
+    id: `EX${Date.now()}`,
+    requestedBy: currentUser.username,
+    requestedAt: new Date().toISOString(),
+    format: exportFormat,
+    rowCount: rows.length,
+    filters: {
+      surveyId: state.reportSurveyFilter,
+      customer: state.reportCustomerFilter,
+      completedFrom: state.reportFrom,
+      completedTo: state.reportTo,
+    },
+  });
+  showToast(`Đã export ${rows.length} dòng raw data từ ${sourceReports.length} kết quả đang lọc.`);
+  renderReports();
+}
+
 function answerCount(question) {
   return Array.isArray(question.options) ? question.options.length : 0;
 }
@@ -1122,12 +1352,141 @@ function defaultMatrixColumns(type = "") {
   return ["Cơm/món chính", "Đồ uống", "Đồ ăn vặt"];
 }
 
+function questionSupportsOptions(type) {
+  type = normalizedQuestionType(type);
+  return ["Chọn một đáp án", "Chọn nhiều đáp án", "Đánh giá", RANKING_TYPE, TOP_N_TYPE].includes(type);
+}
+
+function operatorOptionsForQuestion(question) {
+  const type = normalizedQuestionType(question?.type || "");
+  if (type === RANKING_TYPE) return ["Có chứa lựa chọn", RANKING_POSITION_OPERATOR];
+  if (type === TOP_N_TYPE) return ["Có chứa lựa chọn"];
+  if (type === "Chọn một đáp án") return ["Bằng (=)", "Khác (!=)"];
+  if (type === "Chọn nhiều đáp án" || type === MATRIX_MULTI_TYPE) return ["Có chứa", "Không chứa"];
+  if (type === "Văn bản") return ["Có chứa", "Không chứa", "Bằng (=)", "Khác (!=)"];
+  if (["Số", "Ngày", "Đánh giá", MATRIX_RATING_TYPE].includes(type)) return ["Bằng (=)", "Khác (!=)", "Lớn hơn", "Lớn hơn hoặc bằng", "Nhỏ hơn", "Nhỏ hơn hoặc bằng"];
+  return ["Bằng (=)", "Khác (!=)"];
+}
+
+function defaultOptionsForType(type) {
+  if (type === "Đánh giá") return ["1", "2", "3", "4", "5"];
+  if (type === RANKING_TYPE) return ["Chất lượng bác sĩ", "Thời gian chờ", "Giá dịch vụ", "Thái độ nhân viên", "Cơ sở vật chất"];
+  if (type === TOP_N_TYPE) return ["Bác sĩ giỏi", "Gần nhà", "Giá hợp lý", "Đặt lịch nhanh", "Ít phải chờ", "Nhân viên hỗ trợ tốt", "Cơ sở vật chất hiện đại"];
+  if (type === "Chọn một đáp án" || type === "Chọn nhiều đáp án") return ["Có", "Không"];
+  return [];
+}
+
 function matrixRowsForQuestion(question = {}) {
   return Array.isArray(question.matrixRows) && question.matrixRows.length ? question.matrixRows : isMatrixRatingType(question.type) ? defaultMatrixRatingRows() : defaultMatrixRows();
 }
 
 function matrixColumnsForQuestion(question = {}) {
   return Array.isArray(question.matrixColumns) && question.matrixColumns.length ? question.matrixColumns : defaultMatrixColumns(question.type);
+}
+
+function rankingOptionsForQuestion(question = {}) {
+  return Array.isArray(question.options) && question.options.length ? question.options : defaultOptionsForType(RANKING_TYPE);
+}
+
+function rankingAnswerForQuestion(question = {}) {
+  const configuredOptions = rankingOptionsForQuestion(question);
+  const current = state.answers[question.code];
+  const ordered = Array.isArray(current) && current.length ? current.filter((item) => configuredOptions.includes(item)) : configuredOptions;
+  return [...ordered, ...configuredOptions.filter((option) => !ordered.includes(option))];
+}
+
+function formatRankingAnswer(value) {
+  return Array.isArray(value) && value.length ? value.map((item, index) => `${index + 1}. ${item}`).join(" | ") : "Chưa trả lời";
+}
+
+function rankingRuleValueOptions(question, selectedValue = "", operator = "") {
+  const options = rankingOptionsForQuestion(question);
+  if (!options.length) return `<option value="">-- Câu hỏi này chưa có danh sách giá trị --</option>`;
+  if (normalizedText(operator) === normalizedText(RANKING_POSITION_OPERATOR)) {
+    const values = options.flatMap((option) => options.map((_, index) => ({ value: `${option} @ ${index + 1}`, label: `${option} đứng vị trí ${index + 1}` })));
+    return `
+      <option value="">-- Chọn lựa chọn và vị trí --</option>
+      ${values.map((item) => `<option value="${escapeHtml(item.value)}" ${item.value === selectedValue ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
+    `;
+  }
+  return `
+    <option value="">-- Chọn lựa chọn --</option>
+    ${options.map((value) => `<option value="${escapeHtml(value)}" ${value === selectedValue ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+  `;
+}
+
+function isTopNQuestion(type) {
+  return normalizedQuestionType(type) === TOP_N_TYPE;
+}
+
+function topNLimit(question = {}) {
+  const configured = Number(question.topN);
+  return Number.isFinite(configured) && configured > 0 ? configured : 3;
+}
+
+function topNMode(question = {}) {
+  return question.topNMode === "max" ? "max" : "exact";
+}
+
+function topNModeLabel(mode) {
+  return mode === "max" ? "Tối đa N lựa chọn" : "Bắt buộc đúng N lựa chọn";
+}
+
+function topNHint(question = {}) {
+  const limit = topNLimit(question);
+  return topNMode(question) === "max" ? `Chọn tối đa ${limit} đáp án.` : `Chọn đúng ${limit} đáp án.`;
+}
+
+function renderTopNConfig(question = {}) {
+  const limit = topNLimit(question);
+  const mode = topNMode(question);
+  return `
+    <section class="answer-options-panel" id="topNConfigPanel" ${isTopNQuestion(question.type || "") ? "" : "hidden"}>
+      <div class="block-heading compact">
+        <div>
+          <p class="block-eyebrow">Top N</p>
+          <h3 class="block-title">Giới hạn số lượng lựa chọn</h3>
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="questionTopN">Số lựa chọn N</label>
+          <input class="input" id="questionTopN" name="topN" type="number" min="1" value="${escapeHtml(limit)}" />
+        </div>
+        <div class="field">
+          <label for="questionTopNMode">Quy tắc chọn</label>
+          <select class="select" id="questionTopNMode" name="topNMode">
+            <option value="exact" ${mode === "exact" ? "selected" : ""}>Bắt buộc đúng N lựa chọn</option>
+            <option value="max" ${mode === "max" ? "selected" : ""}>Tối đa N lựa chọn</option>
+          </select>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderTopNAnswerControl(question, value) {
+  const values = Array.isArray(value) ? value : [];
+  const limit = topNLimit(question);
+  return `
+    <div class="answer-stack top-n-answer">
+      <div class="top-n-counter">${values.length}/${limit} đã chọn · ${topNHint(question)}</div>
+      ${(question.options || [])
+        .map((option) => {
+          const checked = values.includes(option);
+          const selectedIndex = values.indexOf(option);
+          const disabled = !checked && values.length >= limit;
+          return `
+            <label class="answer-option ${disabled ? "is-disabled" : ""}">
+              <input type="checkbox" value="${escapeHtml(option)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} data-top-n-answer="${escapeHtml(question.code)}" />
+              <span>${escapeHtml(option)}</span>
+              ${selectedIndex >= 0 ? `<span class="top-n-rank-badge">Top ${selectedIndex + 1}</span>` : ""}
+            </label>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
 }
 
 function renderSurveyInfoBlock(survey, questionCount, ruleCount) {
@@ -1345,7 +1704,7 @@ function renderDashboard() {
 
 function renderSurveyActions(survey) {
   const active = isSurveyStatusActive(survey.status);
-  const inactive = isSurveyPausedStatus(survey.status) || survey.active === false;
+  const inactive = isSurveyInactiveStatus(survey.status) || survey.active === false;
   const paused = isSurveyPausedStatus(survey.status);
   const ended = isSurveyEndedStatus(survey.status);
   const expired = isSurveyExpiredStatus(survey.status);
@@ -1353,6 +1712,33 @@ function renderSurveyActions(survey) {
   const canToggleActive = active || paused;
   const editButton = inactive
     ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Khảo sát không hoạt động không được sửa" title="Khảo sát không hoạt động không được sửa">${icon("edit")}</button>`
+    : !ended
+      ? actionButton("edit-survey", survey.id, "edit", "Sửa khảo sát")
+      : "";
+  return `
+    ${actionButton("open-survey", survey.id, "eye", "Xem khảo sát")}
+    ${editButton}
+    ${actionButton("copy-survey", survey.id, "copy", "Sao chép khảo sát")}
+    ${canApprove ? actionButton("publish-survey", survey.id, "trend", "Duyệt khảo sát") : ""}
+    ${canToggleActive ? actionButton("archive-survey", survey.id, active ? "clock" : "trend", active ? "Ngưng hoạt động" : "Hoạt động trở lại") : ""}
+    ${!ended ? actionButton("finish-survey", survey.id, "check", "Kết thúc khảo sát") : ""}
+    ${
+      active
+        ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Không thể xóa khảo sát đang hoạt động" title="Không thể xóa khảo sát đang hoạt động">${icon("trash")}</button>`
+        : actionButton("delete-survey", survey.id, "trash", "Xóa khảo sát", "danger")
+    }
+  `;
+}
+
+function renderSurveyActions(survey) {
+  const active = isSurveyStatusActive(survey.status);
+  const paused = isSurveyPausedStatus(survey.status);
+  const ended = isSurveyEndedStatus(survey.status);
+  const expired = isSurveyExpiredStatus(survey.status);
+  const canApprove = !active && !paused && !ended && !expired;
+  const canToggleActive = active || paused;
+  const editButton = active
+    ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Khảo sát đang hoạt động không được sửa" title="Khảo sát đang hoạt động không được sửa">${icon("edit")}</button>`
     : !ended
       ? actionButton("edit-survey", survey.id, "edit", "Sửa khảo sát")
       : "";
@@ -1921,7 +2307,7 @@ function renderReports() {
   const surveyOptions = ["all", ...new Set(reports.map((report) => report.surveyId).filter(Boolean))];
 
   content.innerHTML = `
-    ${renderHeader("Báo cáo", "Lọc, xem nhanh và export raw data kết quả khảo sát.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export CSV</button>`)}
+    ${renderHeader("Báo cáo", "Lọc danh sách kết quả và export raw data chi tiết theo filter hiện tại.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export raw data</button>`)}
     <form class="panel report-filter-panel" id="reportSearchForm">
       <div class="form-grid four">
         <div class="field">
@@ -2021,7 +2407,7 @@ function renderReports() {
   const surveyValue = state.reportSurveyDraft || (state.reportSurveyFilter === "all" ? "" : state.reportSurveyFilter);
 
   content.innerHTML = `
-    ${renderHeader("Báo cáo", "Lọc, xem nhanh và export raw data kết quả khảo sát.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export CSV</button>`)}
+    ${renderHeader("Báo cáo", "Lọc danh sách kết quả và export raw data chi tiết theo filter hiện tại.", `<button class="btn primary" type="button" data-action="export-reports">${icon("file")} Export raw data</button>`)}
     <form class="panel report-filter-panel" id="reportSearchForm">
       <div class="report-filter-grid">
         <div class="field">
@@ -2436,7 +2822,7 @@ function renderSurveyDetail() {
   }
   const surveyQs = selectedQuestions();
   const surveyRs = selectedRules();
-  const surveyEntryQs = entryQuestions();
+  const surveyEntryQs = previewQuestions();
   const tabContent = {
     questions: renderQuestionsTab(surveyQs),
     branching: renderBranchingTab(surveyRs),
@@ -2642,9 +3028,9 @@ function renderQuestionsTab(surveyQs) {
                   (question) => `
                   <article class="question-card question-table-row ${question.active ? "" : "is-inactive"}" draggable="true" data-question-id="${question.id}">
                     <button class="drag-handle" type="button" aria-label="Kéo để sắp xếp câu hỏi" title="Kéo để sắp xếp">⋮⋮</button>
-                    <span class="table-cell item-title">${escapeHtml(question.code)}</span>
+                    <button class="table-link-cell" type="button" data-action="view-question" data-id="${question.id}">${escapeHtml(question.code)}</button>
                     <div>
-                      <h3 class="question-title">${escapeHtml(question.text)}</h3>
+                      <button class="question-title question-title-button" type="button" data-action="view-question" data-id="${question.id}">${escapeHtml(question.text)}</button>
                       <div class="item-meta">${question.options?.length ? question.options.map(escapeHtml).join(", ") : ""}${isMatrixQuestionType(question.type) ? `${matrixRowsForQuestion(question).length} dòng · ${matrixColumnsForQuestion(question).length} cột` : ""}</div>
                     </div>
                     <span class="table-cell">${escapeHtml(normalizedQuestionType(question.type))}</span>
@@ -2660,7 +3046,7 @@ function renderQuestionsTab(surveyQs) {
                     <div class="question-actions">
                       ${actionButton("add-rule", question.id, "branch", "Thêm điều kiện từ câu hỏi")}
                       ${
-                        question.active === false
+                        question.active !== false
                           ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Câu hỏi không hoạt động không được sửa" title="Câu hỏi không hoạt động không được sửa">${icon("edit")}</button>`
                           : actionButton("edit-question", question.id, "edit", "Sửa câu hỏi")
                       }
@@ -2729,7 +3115,7 @@ function renderBranchingTab(surveyRs) {
                     <div class="question-actions">
                       ${actionButton("view-rule", rule.id, "eye", "Xem điều kiện")}
                       ${
-                        rule.active === false
+                        rule.active !== false
                           ? `<button class="icon-action is-disabled" type="button" disabled aria-label="Điều kiện không hoạt động không được sửa" title="Điều kiện không hoạt động không được sửa">${icon("edit")}</button>`
                           : actionButton("edit-rule", rule.id, "edit", "Sửa điều kiện")
                       }
@@ -3079,6 +3465,50 @@ function renderAnswerControl(question) {
     `;
   }
 
+  if (type === RANKING_TYPE) {
+    const rankedValues = rankingAnswerForQuestion(question);
+    return `
+      <div class="ranking-answer" data-ranking-list="${escapeHtml(question.code)}">
+        <p class="ranking-hint">Sắp xếp theo thứ tự ưu tiên từ cao xuống thấp.</p>
+        ${rankedValues
+          .map(
+            (option, index) => `
+              <div class="ranking-item">
+                <span class="ranking-position">${index + 1}</span>
+                <span class="ranking-label">${escapeHtml(option)}</span>
+                <div class="ranking-actions">
+                  <button class="icon-action" type="button" data-action="rank-option-up" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === 0 ? "disabled" : ""} aria-label="Đưa lên">${icon("chevron-up")}</button>
+                  <button class="icon-action" type="button" data-action="rank-option-down" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === rankedValues.length - 1 ? "disabled" : ""} aria-label="Đưa xuống">${icon("chevron-down")}</button>
+                </div>
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+    `;
+  }
+  if (type === RANKING_TYPE) {
+    const rankedValues = rankingAnswerForQuestion(question);
+    return `
+      <div class="ranking-answer" data-ranking-list="${escapeHtml(question.code)}">
+        <p class="ranking-hint">Sắp xếp theo thứ tự ưu tiên từ cao xuống thấp.</p>
+        ${rankedValues
+          .map(
+            (option, index) => `
+              <div class="ranking-item">
+                <span class="ranking-position">${index + 1}</span>
+                <span class="ranking-label">${escapeHtml(option)}</span>
+                <div class="ranking-actions">
+                  <button class="icon-action" type="button" data-action="rank-option-up" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === 0 ? "disabled" : ""} aria-label="Đưa lên">${icon("chevron-up")}</button>
+                  <button class="icon-action" type="button" data-action="rank-option-down" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === rankedValues.length - 1 ? "disabled" : ""} aria-label="Đưa xuống">${icon("chevron-down")}</button>
+                </div>
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+    `;
+  }
   if (type === "Số") {
     return `<input class="input" style="margin-top: 16px" type="number" min="${escapeHtml(question.minValue || "")}" max="${escapeHtml(question.maxValue || "")}" data-answer-text="${question.code}" value="${escapeHtml(value || question.defaultValue || "")}" placeholder="${escapeHtml(question.placeholder || "Nhập giá trị số...")}" />`;
   }
@@ -3087,6 +3517,28 @@ function renderAnswerControl(question) {
     return `<input class="input" style="margin-top: 16px" type="date" min="${escapeHtml(question.minDate || "")}" max="${escapeHtml(question.maxDate || "")}" data-answer-text="${question.code}" value="${escapeHtml(value || question.defaultDate || "")}" />`;
   }
 
+  if (type === RANKING_TYPE) {
+    const rankedValues = rankingAnswerForQuestion(question);
+    return `
+      <div class="ranking-answer" data-ranking-list="${escapeHtml(question.code)}">
+        <p class="ranking-hint">Sắp xếp theo thứ tự ưu tiên từ cao xuống thấp.</p>
+        ${rankedValues
+          .map(
+            (option, index) => `
+              <div class="ranking-item">
+                <span class="ranking-position">${index + 1}</span>
+                <span class="ranking-label">${escapeHtml(option)}</span>
+                <div class="ranking-actions">
+                  <button class="icon-action" type="button" data-action="rank-option-up" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === 0 ? "disabled" : ""} aria-label="Đưa lên">${icon("chevron-up")}</button>
+                  <button class="icon-action" type="button" data-action="rank-option-down" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === rankedValues.length - 1 ? "disabled" : ""} aria-label="Đưa xuống">${icon("chevron-down")}</button>
+                </div>
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+    `;
+  }
   return `<input class="input" style="margin-top: 16px" type="text" data-answer-text="${question.code}" value="${escapeHtml(value)}" placeholder="${escapeHtml(question.placeholder || "Nhập câu trả lời...")}" />`;
 }
 
@@ -3167,6 +3619,102 @@ function renderAnswerControl(question) {
     return `<input class="input" style="margin-top: 16px" type="date" min="${escapeHtml(question.minDate || "")}" max="${escapeHtml(question.maxDate || "")}" data-answer-text="${question.code}" value="${escapeHtml(value || question.defaultDate || "")}" />`;
   }
   return `<input class="input" style="margin-top: 16px" type="text" data-answer-text="${question.code}" value="${escapeHtml(value)}" placeholder="${escapeHtml(question.placeholder || "Nhập câu trả lời...")}" />`;
+}
+
+function renderRankingAnswerControl(question) {
+  const rankedValues = rankingAnswerForQuestion(question);
+  return `
+    <div class="ranking-answer" data-ranking-list="${escapeHtml(question.code)}">
+      <p class="ranking-hint">Sắp xếp theo thứ tự ưu tiên từ cao xuống thấp.</p>
+      ${rankedValues
+        .map(
+          (option, index) => `
+            <div class="ranking-item">
+              <span class="ranking-position">${index + 1}</span>
+              <span class="ranking-label">${escapeHtml(option)}</span>
+              <div class="ranking-actions">
+                <button class="icon-action" type="button" data-action="rank-option-up" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === 0 ? "disabled" : ""} aria-label="Đưa lên">${icon("chevron-up")}</button>
+                <button class="icon-action" type="button" data-action="rank-option-down" data-code="${escapeHtml(question.code)}" data-index="${index}" ${index === rankedValues.length - 1 ? "disabled" : ""} aria-label="Đưa xuống">${icon("chevron-down")}</button>
+              </div>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderAnswerControl(question) {
+  const type = normalizedQuestionType(question.type);
+  const value = state.answers[question.code] || "";
+  if (type === TOP_N_TYPE) return renderTopNAnswerControl(question, value);
+  if (type === RANKING_TYPE) return renderRankingAnswerControl(question);
+  if (isMatrixQuestionType(type)) {
+    const matrixValue = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const rows = matrixRowsForQuestion(question);
+    const columns = matrixColumnsForQuestion(question);
+    const isMultiple = isMatrixMultipleType(type);
+    const isRating = isMatrixRatingType(type);
+    return `
+      <div class="matrix-answer ${isRating ? "matrix-rating-answer" : ""}" role="group" aria-label="${escapeHtml(question.text)}">
+        <div class="matrix-table" style="--matrix-columns: ${columns.length}">
+          <div class="matrix-row matrix-head">
+            <div class="matrix-label-cell">${isRating ? "Tiêu chí" : "Tình huống"}</div>
+            ${columns.map((column) => `<div class="matrix-choice-head">${escapeHtml(column)}</div>`).join("")}
+          </div>
+          ${rows
+            .map((row, rowIndex) => {
+              const rowAnswer = matrixValue[row];
+              const selectedValues = Array.isArray(rowAnswer) ? rowAnswer : [];
+              return `
+                <div class="matrix-row">
+                  <div class="matrix-label-cell">${escapeHtml(row)}</div>
+                  ${columns
+                    .map((column) => {
+                      const checked = isMultiple ? selectedValues.includes(column) : rowAnswer === column;
+                      const inputType = isMultiple ? "checkbox" : "radio";
+                      const dataAttr = isMultiple ? "data-matrix-multi-answer" : "data-matrix-answer";
+                      return `
+                        <label class="matrix-choice-cell">
+                          <input type="${inputType}" name="matrix-${escapeHtml(question.code)}-${rowIndex}" value="${escapeHtml(column)}" ${checked ? "checked" : ""} ${dataAttr}="${escapeHtml(question.code)}" data-matrix-row="${escapeHtml(row)}" />
+                          <span class="sr-only">${escapeHtml(row)} - ${escapeHtml(column)}</span>
+                        </label>
+                      `;
+                    })
+                    .join("")}
+                </div>
+              `;
+            })
+            .join("")}
+        </div>
+      </div>
+    `;
+  }
+  if (type === "Chọn một đáp án" || type === "Đánh giá") return `<div class="answer-stack">${(question.options || []).map((option) => renderChoiceOptionControl(question, option, value, false)).join("")}</div>`;
+  if (type === "Chọn nhiều đáp án") return `<div class="answer-stack">${(question.options || []).map((option) => renderChoiceOptionControl(question, option, value, true)).join("")}</div>`;
+  if (type === "Số") return `<input class="input" style="margin-top: 16px" type="number" min="${escapeHtml(question.minValue || "")}" max="${escapeHtml(question.maxValue || "")}" data-answer-text="${question.code}" value="${escapeHtml(value || question.defaultValue || "")}" placeholder="${escapeHtml(question.placeholder || "Nhập giá trị số...")}" />`;
+  if (type === "Ngày") return `<input class="input" style="margin-top: 16px" type="date" min="${escapeHtml(question.minDate || "")}" max="${escapeHtml(question.maxDate || "")}" data-answer-text="${question.code}" value="${escapeHtml(value || question.defaultDate || "")}" />`;
+  return `<input class="input" style="margin-top: 16px" type="text" data-answer-text="${question.code}" value="${escapeHtml(value)}" placeholder="${escapeHtml(question.placeholder || "Nhập câu trả lời...")}" />`;
+}
+
+function renderRankingAnswerControl(question) {
+  const rankedValues = rankingAnswerForQuestion(question);
+  return `
+    <div class="ranking-answer" data-ranking-list="${escapeHtml(question.code)}">
+      <p class="ranking-hint">Kéo thả để sắp xếp theo thứ tự ưu tiên từ cao xuống thấp.</p>
+      ${rankedValues
+        .map(
+          (option, index) => `
+            <div class="ranking-item" draggable="true" data-ranking-code="${escapeHtml(question.code)}" data-ranking-index="${index}">
+              <span class="ranking-position">${index + 1}</span>
+              <span class="ranking-label">${escapeHtml(option)}</span>
+              <span class="ranking-drag-handle" aria-hidden="true">⋮⋮</span>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
 }
 
 function renderAnswerOptionRows(options) {
@@ -3284,6 +3832,7 @@ function updateAnswerOptionsVisibility() {
   const form = document.querySelector("#questionForm");
   if (!form) return;
   const panel = form.querySelector("#answerOptionsPanel");
+  const topNPanel = form.querySelector("#topNConfigPanel");
   const matrixPanel = form.querySelector("#matrixConfigPanel");
   const valuePanel = form.querySelector("#questionValueConfigPanel");
   const valueBody = form.querySelector("#questionValueConfigBody");
@@ -3293,6 +3842,7 @@ function updateAnswerOptionsVisibility() {
   if (questionSupportsOptions(type) && !panel.querySelector("[name='optionValue']")) {
     panel.querySelector(".answer-option-list").innerHTML = renderAnswerOptionRows(defaultOptionsForType(type));
   }
+  if (topNPanel) topNPanel.hidden = !isTopNQuestion(type);
   matrixPanel.hidden = !isMatrixQuestionType(type);
   if (isMatrixQuestionType(type) && !matrixPanel.querySelector("[name='matrixRowValue']")) {
     matrixPanel.querySelector(".matrix-row-config-list").innerHTML = renderMatrixConfigRows(isMatrixRatingType(type) ? defaultMatrixRatingRows() : defaultMatrixRows(), "matrixRowValue", "Tiêu chí");
@@ -3306,6 +3856,163 @@ function updateAnswerOptionsVisibility() {
   valuePanel.hidden = !questionValueConfigVisible(type);
   valueTitle.textContent = type === "Ngày" ? "Khoảng ngày hợp lệ" : "Khoảng số hợp lệ";
   valueBody.innerHTML = renderQuestionValueConfig(type);
+}
+
+function renderReadonlyOptionRows(options = []) {
+  return options.length
+    ? options
+        .map(
+          (option, index) => `
+          <div class="answer-option-row ${isOtherOption(option) ? "is-system-option" : ""}">
+            <input class="input" value="${escapeHtml(isOtherOption(option) ? OTHER_OPTION_LABEL : option)}" readonly disabled placeholder="Đáp án ${index + 1}" />
+            <span></span>
+          </div>
+        `,
+        )
+        .join("")
+    : `<p class="item-meta">Không có danh sách đáp án.</p>`;
+}
+
+function renderReadonlyMatrixRows(values = [], label = "Giá trị") {
+  return values.length
+    ? values
+        .map(
+          (value, index) => `
+          <div class="answer-option-row">
+            <input class="input" value="${escapeHtml(value)}" readonly disabled placeholder="${escapeHtml(label)} ${index + 1}" />
+            <span></span>
+          </div>
+        `,
+        )
+        .join("")
+    : `<p class="item-meta">Không có cấu hình.</p>`;
+}
+
+function openQuestionViewModal(questionId) {
+  const question = questions.find((item) => item.id === questionId);
+  if (!question) return;
+  const type = normalizedQuestionType(question.type);
+  openModal(`
+    <div class="modal large-modal" role="dialog" aria-modal="true" aria-labelledby="questionViewTitle">
+      <div class="modal-header">
+        <h2 class="modal-title" id="questionViewTitle">Chi tiết câu hỏi</h2>
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Đóng">×</button>
+      </div>
+      <div class="modal-body readonly-form">
+        <div class="form-grid three">
+          <div class="field">
+            <label>Mã câu hỏi</label>
+            <input class="input" value="${escapeHtml(question.code || "—")}" readonly disabled />
+          </div>
+          <div class="field">
+            <label>Thứ tự</label>
+            <input class="input" value="${escapeHtml(question.order || "—")}" readonly disabled />
+          </div>
+          <div class="field">
+            <label>Loại câu hỏi</label>
+            <input class="input" value="${escapeHtml(type || "—")}" readonly disabled />
+          </div>
+          <div class="field full">
+            <label>Nội dung câu hỏi</label>
+            <textarea class="textarea" readonly disabled>${escapeHtml(question.text || "")}</textarea>
+          </div>
+          <div class="field full">
+            <label>Kịch bản Agent (gợi ý đọc)</label>
+            <textarea class="textarea" readonly disabled>${escapeHtml(question.agentScript || "")}</textarea>
+          </div>
+        </div>
+        ${
+          questionSupportsOptions(type)
+            ? `
+            <section class="answer-options-panel">
+              <div class="block-heading compact">
+                <div>
+                  <p class="block-eyebrow">Đáp án</p>
+                  <h3 class="block-title">Danh sách lựa chọn</h3>
+                </div>
+              </div>
+              <div class="answer-option-list">${renderReadonlyOptionRows(question.options || [])}</div>
+            </section>
+          `
+            : ""
+        }
+        ${
+          isMatrixQuestionType(type)
+            ? `
+            <section class="answer-options-panel">
+              <div class="block-heading compact">
+                <div>
+                  <p class="block-eyebrow">Ma trận</p>
+                  <h3 class="block-title">Cấu hình dòng/cột</h3>
+                </div>
+              </div>
+              <div class="matrix-config-grid">
+                <div>
+                  <div class="matrix-config-head"><h4>Dòng/Tiêu chí</h4></div>
+                  ${renderReadonlyMatrixRows(matrixRowsForQuestion(question), "Dòng")}
+                </div>
+                <div>
+                  <div class="matrix-config-head"><h4>Cột/Thang điểm</h4></div>
+                  ${renderReadonlyMatrixRows(matrixColumnsForQuestion(question), "Cột")}
+                </div>
+              </div>
+            </section>
+          `
+            : ""
+        }
+        ${
+          questionValueConfigVisible(type)
+            ? `
+            <section class="answer-options-panel">
+              <div class="block-heading compact">
+                <div>
+                  <p class="block-eyebrow">Cấu hình nhập liệu</p>
+                  <h3 class="block-title">${type === "Số" ? "Giá trị số" : "Ngày"}</h3>
+                </div>
+              </div>
+              <div class="form-grid three">
+                <div class="field"><label>${type === "Số" ? "Giá trị nhỏ nhất" : "Từ ngày"}</label><input class="input" value="${escapeHtml(type === "Số" ? question.minValue || "" : question.minDate || "")}" readonly disabled /></div>
+                <div class="field"><label>${type === "Số" ? "Giá trị lớn nhất" : "Đến ngày"}</label><input class="input" value="${escapeHtml(type === "Số" ? question.maxValue || "" : question.maxDate || "")}" readonly disabled /></div>
+                <div class="field"><label>${type === "Số" ? "Giá trị mặc định" : "Ngày mặc định"}</label><input class="input" value="${escapeHtml(type === "Số" ? question.defaultValue || "" : question.defaultDate || "")}" readonly disabled /></div>
+              </div>
+            </section>
+          `
+            : ""
+        }
+        ${
+          isTopNQuestion(type)
+            ? `
+            <section class="answer-options-panel">
+              <div class="block-heading compact">
+                <div>
+                  <p class="block-eyebrow">Top N</p>
+                  <h3 class="block-title">Cấu hình giới hạn lựa chọn</h3>
+                </div>
+              </div>
+              <div class="form-grid">
+                <div class="field"><label>Số lựa chọn N</label><input class="input" value="${escapeHtml(topNLimit(question))}" readonly disabled /></div>
+                <div class="field"><label>Quy tắc chọn</label><input class="input" value="${escapeHtml(topNModeLabel(topNMode(question)))}" readonly disabled /></div>
+              </div>
+            </section>
+          `
+            : ""
+        }
+        <section class="answer-options-panel">
+          <div class="form-grid four">
+            <div class="field"><label>Bắt buộc trả lời</label><input class="input" value="${question.required ? "Có" : "Không"}" readonly disabled /></div>
+            <div class="field"><label>Trạng thái</label><input class="input" value="${question.active === false ? "Không hoạt động" : "Hoạt động"}" readonly disabled /></div>
+            <div class="field"><label>Người tạo</label><input class="input" value="${escapeHtml(displayUserName(question.createdBy || question.updatedBy))}" readonly disabled /></div>
+            <div class="field"><label>Ngày tạo</label><input class="input" value="${escapeHtml(displayDateTime(question.createdAt || question.updatedAt))}" readonly disabled /></div>
+            <div class="field"><label>Người cập nhật</label><input class="input" value="${escapeHtml(displayUserName(question.updatedBy))}" readonly disabled /></div>
+            <div class="field"><label>Ngày cập nhật</label><input class="input" value="${escapeHtml(displayDateTime(question.updatedAt))}" readonly disabled /></div>
+          </div>
+        </section>
+        <div class="form-footer">
+          <button class="btn secondary" type="button" data-action="close-modal">Đóng</button>
+        </div>
+      </div>
+    </div>
+  `);
 }
 
 function openQuestionModal(questionId = null) {
@@ -3337,6 +4044,8 @@ function openQuestionModal(questionId = null) {
           <div class="field">
             <label for="questionType">Loại câu hỏi</label>
             <select class="select" id="questionType" name="type">
+              <option ${RANKING_TYPE === selectedType ? "selected" : ""}>${RANKING_TYPE}</option>
+              <option ${TOP_N_TYPE === selectedType ? "selected" : ""}>${TOP_N_TYPE}</option>
               ${["Chọn một đáp án", "Chọn nhiều đáp án", MATRIX_MULTI_TYPE, MATRIX_RATING_TYPE, "Văn bản", "Số", "Đánh giá", "Ngày"]
                 .map((type) => `<option ${type === selectedType ? "selected" : ""}>${type}</option>`)
                 .join("")}
@@ -3363,6 +4072,7 @@ function openQuestionModal(questionId = null) {
             ${renderAnswerOptionRows(optionValues)}
           </div>
         </section>
+        ${renderTopNConfig(editingQuestion || { type: selectedType })}
         <section class="answer-options-panel" id="matrixConfigPanel" ${isMatrixQuestionType(selectedType) ? "" : "hidden"}>
           <div class="block-heading compact">
             <div>
@@ -3438,6 +4148,8 @@ function openQuestionModal(questionId = null) {
       matrixColumns: isMatrixQuestionType(type) ? (matrixColumns.length ? matrixColumns : defaultMatrixColumns(type)) : [],
       matrixRequiredMode: isMatrixQuestionType(type) && !isMatrixRatingType(type) ? data.matrixRequiredMode || "each_column_min_one" : "",
       minColumnSelections: isMatrixQuestionType(type) && !isMatrixRatingType(type) ? Math.max(Number(data.minColumnSelections) || 1, 1) : "",
+      topN: isTopNQuestion(type) ? Math.max(Number(data.topN) || 3, 1) : "",
+      topNMode: isTopNQuestion(type) ? data.topNMode || "exact" : "",
       agentScript: data.agentScript.trim(),
       guideText: editingQuestion?.guideText || "",
       placeholder: editingQuestion?.placeholder || "",
@@ -3470,7 +4182,8 @@ function openQuestionModal(questionId = null) {
   updateAnswerOptionsVisibility();
 }
 
-function comparisonValueOptions(question, selectedValue = "") {
+function comparisonValueOptions(question, selectedValue = "", operator = "") {
+  if (normalizedQuestionType(question?.type) === RANKING_TYPE) return rankingRuleValueOptions(question, selectedValue, operator);
   const values = isMatrixQuestionType(question?.type)
     ? matrixColumnsForQuestion(question)
     : question?.options?.length
@@ -3483,7 +4196,7 @@ function comparisonValueOptions(question, selectedValue = "") {
   `;
 }
 
-function comparisonValueControl(question, selectedValue = "", fieldName = "value", fieldId = "ruleValue", required = true) {
+function comparisonValueControl(question, selectedValue = "", fieldName = "value", fieldId = "ruleValue", required = true, operator = "") {
   const requiredAttr = required ? "required" : "";
   if (question?.type === "Số") {
     return `<input class="input" id="${fieldId}" name="${fieldName}" type="number" value="${escapeHtml(selectedValue)}" placeholder="${required ? "Nhập giá trị số" : "Có thể bỏ trống để kết thúc luôn"}" ${requiredAttr} />`;
@@ -3497,7 +4210,7 @@ function comparisonValueControl(question, selectedValue = "", fieldName = "value
   return `
     <select class="select" id="${fieldId}" name="${fieldName}" ${requiredAttr}>
       ${required ? "" : `<option value="" ${selectedValue ? "" : "selected"}>-- Không cần giá trị --</option>`}
-      ${comparisonValueOptions(question, selectedValue)}
+      ${comparisonValueOptions(question, selectedValue, operator)}
     </select>
   `;
 }
@@ -3583,7 +4296,7 @@ function renderRuleGroupRows(groups = [], sourceQuestion = null) {
             }
             <div class="field rule-value-field">
               <label for="${groupId}Value">Giá trị so sánh</label>
-              ${comparisonValueControl(sourceQuestion, group.value || "", "value", `${groupId}Value`, !isEndAction)}
+              ${comparisonValueControl(sourceQuestion, group.value || "", "value", `${groupId}Value`, !isEndAction, selectedOperator)}
               ${isEndAction ? `<p class="field-hint">Bỏ trống nếu muốn kết thúc khảo sát ngay khi tới câu hỏi nguồn.</p>` : ""}
             </div>
             <div class="field">
@@ -3827,14 +4540,15 @@ function openRuleModal(ruleId = null, sourceQuestionId = null) {
           target: isEndAction ? "" : selectedTarget,
         };
       })
-      .filter((group) => group.value || group.target || group.action === "Kết thúc khảo sát");
+      .filter((group) => group.value || group.target || normalizedText(group.action) === normalizedText("Kết thúc khảo sát"));
     if (!groups.length) {
       showToast("Cần cấu hình ít nhất một nhóm điều kiện.");
       return;
     }
     const invalidGroupIndex = groups.findIndex((group) => {
-      if (group.action === "Kết thúc khảo sát" && !group.value) return false;
-      return !group.value || (isMatrixRatingType(sourceQuestion?.type) && group.matrixScope === "row" && !group.matrixRow) || (group.action !== "Kết thúc khảo sát" && !group.target);
+      const isEndAction = normalizedText(group.action) === normalizedText("Kết thúc khảo sát");
+      if (isEndAction && !group.value) return false;
+      return !group.value || (isMatrixRatingType(sourceQuestion?.type) && group.matrixScope === "row" && !group.matrixRow) || (!isEndAction && !group.target);
     });
     if (invalidGroupIndex >= 0) {
       showToast(`Nhóm ${invalidGroupIndex + 1} cần đủ giá trị so sánh và câu hỏi đích.`);
@@ -4142,6 +4856,7 @@ document.addEventListener("click", (event) => {
     render();
   }
   if (action === "export-reports") exportReportsCsv();
+  if (action === "view-question") openQuestionViewModal(actionTarget.dataset.id);
   if (action === "select-customer") {
     state.selectedCustomerId = actionTarget.dataset.id;
     showToast("Đã chọn khách hàng.");
@@ -4248,7 +4963,7 @@ document.addEventListener("click", (event) => {
   }
   if (action === "edit-survey") {
     const survey = surveys.find((item) => item.id === actionTarget.dataset.id);
-    if (isSurveyPausedStatus(survey?.status) || survey?.active === false) return showToast("Khảo sát không hoạt động không được sửa.");
+    if (isSurveyStatusActive(survey?.status)) return showToast("Khảo sát đang hoạt động không được sửa.");
     openSurveyEditModal(actionTarget.dataset.id);
   }
   if (action === "copy-survey") {
@@ -4361,7 +5076,7 @@ document.addEventListener("click", (event) => {
   if (action === "add-question") openQuestionModal();
   if (action === "edit-question") {
     const question = questions.find((item) => item.id === actionTarget.dataset.id);
-    if (question?.active === false) return showToast("Câu hỏi không hoạt động không được sửa.");
+    if (question?.active !== false) return showToast("Câu hỏi đang hoạt động không được sửa.");
     openQuestionModal(actionTarget.dataset.id);
   }
   if (action === "toggle-question") {
@@ -4395,6 +5110,11 @@ document.addEventListener("click", (event) => {
     if (list) list.insertAdjacentHTML("beforeend", renderAnswerOptionRows([""]));
   }
   if (action === "add-other-option") {
+    const currentQuestionType = document.querySelector("#questionType")?.value || "";
+    if ([RANKING_TYPE, TOP_N_TYPE].includes(normalizedQuestionType(currentQuestionType))) {
+      showToast("Loại câu hỏi này không dùng đáp án Khác.");
+      return;
+    }
     const list = document.querySelector(".answer-option-list");
     if (!list) return;
     const existingValues = [...list.querySelectorAll('[name="optionValue"]')].map((input) => normalizedText(input.value));
@@ -4409,6 +5129,19 @@ document.addEventListener("click", (event) => {
     const list = actionTarget.closest(".answer-option-list");
     if (row && list && list.querySelectorAll(".answer-option-row").length > 1) row.remove();
     else showToast("Cần giữ lại ít nhất một đáp án.");
+  }
+  if (action === "rank-option-up" || action === "rank-option-down") {
+    const question = entryQuestions().find((item) => item.code === actionTarget.dataset.code) || previewQuestions().find((item) => item.code === actionTarget.dataset.code);
+    if (!question) return;
+    const index = Number(actionTarget.dataset.index);
+    const direction = action === "rank-option-up" ? -1 : 1;
+    const nextIndex = index + direction;
+    const ordered = rankingAnswerForQuestion(question);
+    if (nextIndex < 0 || nextIndex >= ordered.length) return;
+    [ordered[index], ordered[nextIndex]] = [ordered[nextIndex], ordered[index]];
+    state.answers[question.code] = ordered;
+    persistPrototypeData();
+    render();
   }
   if (action === "add-matrix-row") {
     const list = document.querySelector(".matrix-row-config-list");
@@ -4462,7 +5195,7 @@ document.addEventListener("click", (event) => {
   }
   if (action === "edit-rule") {
     const rule = rules.find((item) => item.id === actionTarget.dataset.id);
-    if (rule?.active === false) {
+    if (rule?.active !== false) {
       showToast("Điều kiện đang hoạt động. Vui lòng tắt điều kiện trước khi sửa.");
       return;
     }
@@ -4551,6 +5284,17 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("dragstart", (event) => {
+  const rankingItem = event.target.closest(".ranking-item[data-ranking-code]");
+  if (rankingItem) {
+    draggedRanking = {
+      code: rankingItem.dataset.rankingCode,
+      index: Number(rankingItem.dataset.rankingIndex),
+    };
+    rankingItem.classList.add("is-dragging");
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `${draggedRanking.code}:${draggedRanking.index}`);
+    return;
+  }
   const card = event.target.closest(".question-card[data-question-id]");
   if (!card) return;
   draggedQuestionId = card.dataset.questionId;
@@ -4560,6 +5304,14 @@ document.addEventListener("dragstart", (event) => {
 });
 
 document.addEventListener("dragover", (event) => {
+  const rankingItem = event.target.closest(".ranking-item[data-ranking-code]");
+  if (rankingItem && draggedRanking && rankingItem.dataset.rankingCode === draggedRanking.code) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    document.querySelectorAll(".ranking-item.is-drop-target").forEach((item) => item.classList.remove("is-drop-target"));
+    rankingItem.classList.add("is-drop-target");
+    return;
+  }
   const card = event.target.closest(".question-card[data-question-id]");
   if (!card || !draggedQuestionId || card.dataset.questionId === draggedQuestionId) return;
   event.preventDefault();
@@ -4569,11 +5321,30 @@ document.addEventListener("dragover", (event) => {
 });
 
 document.addEventListener("dragleave", (event) => {
+  const rankingItem = event.target.closest(".ranking-item[data-ranking-code]");
+  if (rankingItem && !rankingItem.contains(event.relatedTarget)) rankingItem.classList.remove("is-drop-target");
   const card = event.target.closest(".question-card[data-question-id]");
   if (card && !card.contains(event.relatedTarget)) card.classList.remove("is-drop-target");
 });
 
 document.addEventListener("drop", (event) => {
+  const rankingItem = event.target.closest(".ranking-item[data-ranking-code]");
+  if (rankingItem && draggedRanking && rankingItem.dataset.rankingCode === draggedRanking.code) {
+    event.preventDefault();
+    const question = entryQuestions().find((item) => item.code === draggedRanking.code) || previewQuestions().find((item) => item.code === draggedRanking.code);
+    const targetIndex = Number(rankingItem.dataset.rankingIndex);
+    if (question && Number.isInteger(targetIndex) && targetIndex !== draggedRanking.index) {
+      const ordered = rankingAnswerForQuestion(question);
+      const [moved] = ordered.splice(draggedRanking.index, 1);
+      ordered.splice(targetIndex, 0, moved);
+      state.answers[question.code] = ordered;
+      persistPrototypeData();
+    }
+    draggedRanking = null;
+    document.querySelectorAll(".ranking-item.is-dragging, .ranking-item.is-drop-target").forEach((item) => item.classList.remove("is-dragging", "is-drop-target"));
+    render();
+    return;
+  }
   const card = event.target.closest(".question-card[data-question-id]");
   if (!card || !draggedQuestionId) return;
   event.preventDefault();
@@ -4587,11 +5358,39 @@ document.addEventListener("drop", (event) => {
 });
 
 document.addEventListener("dragend", () => {
+  draggedRanking = null;
   draggedQuestionId = null;
-  document.querySelectorAll(".question-card.is-dragging, .question-card.is-drop-target").forEach((item) => item.classList.remove("is-dragging", "is-drop-target"));
+  document.querySelectorAll(".question-card.is-dragging, .question-card.is-drop-target, .ranking-item.is-dragging, .ranking-item.is-drop-target").forEach((item) => item.classList.remove("is-dragging", "is-drop-target"));
 });
 
 document.addEventListener("change", (event) => {
+  if (["operator", "action"].includes(event.target?.name) && event.target.closest("#ruleForm")) {
+    const form = document.querySelector("#ruleForm");
+    const list = document.querySelector("#ruleGroupList");
+    const sourceQuestion = selectedQuestions().find((question) => question.code === form?.elements.source.value);
+    if (form && list && sourceQuestion) {
+      const validOperators = operatorOptionsForQuestion(sourceQuestion);
+      const groups = [...list.querySelectorAll("[data-rule-group]")].map((row) => {
+        const selectedAction = row.querySelector('[name="action"]')?.value || "Hiển thị câu hỏi";
+        const selectedTarget = row.querySelector('[name="target"]')?.value || "";
+        const isEndAction = normalizedText(selectedAction) === normalizedText("Kết thúc khảo sát");
+        const selectedOperator = row.querySelector('[name="operator"]')?.value || defaultOperatorForQuestion(sourceQuestion);
+        const matrixScope = isMatrixRatingType(sourceQuestion?.type) ? row.querySelector('[name="matrixScope"]')?.value || "row" : "row";
+        return {
+          id: row.dataset.groupId,
+          operator: validOperators.includes(selectedOperator) ? selectedOperator : defaultOperatorForQuestion(sourceQuestion),
+          matrixScope,
+          matrixRow: (!isMatrixRatingType(sourceQuestion?.type) || matrixScope === "row") ? row.querySelector('[name="matrixRow"]')?.value || "" : "",
+          value: row.querySelector('[name="value"]')?.value || "",
+          action: selectedAction,
+          target: isEndAction ? "" : selectedTarget,
+        };
+      });
+      list.innerHTML = renderRuleGroupRows(groups, sourceQuestion);
+    }
+    return;
+  }
+
   const answerCode = event.target.dataset.answer;
   if (answerCode) {
     state.answers[answerCode] = event.target.value;
@@ -4615,6 +5414,16 @@ document.addEventListener("change", (event) => {
     });
     if (![...values].some(isOtherOption)) delete state.answers[otherAnswerKey(multiCode)];
     persistPrototypeData();
+  }
+
+  const topNCode = event.target.dataset.topNAnswer;
+  if (topNCode) {
+    const values = new Set(Array.isArray(state.answers[topNCode]) ? state.answers[topNCode] : []);
+    if (event.target.checked) values.add(event.target.value);
+    else values.delete(event.target.value);
+    state.answers[topNCode] = [...values];
+    persistPrototypeData();
+    render();
   }
 
   const matrixCode = event.target.dataset.matrixAnswer;
