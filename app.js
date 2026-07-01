@@ -1502,6 +1502,14 @@ function optionCodeForAnswer(question, answerValue) {
   return option?.code || cleanReportFieldPart(answerValue) || "VALUE";
 }
 
+function isOtherAnswerValue(value) {
+  return normalizedText(String(value || "").split(" - ")[0]) === normalizedText(OTHER_OPTION_LABEL);
+}
+
+function selectedOtherExportValue(value) {
+  return isOtherAnswerValue(value) ? String(value || OTHER_OPTION_LABEL) : 1;
+}
+
 function report2ColumnsForSurvey(surveyId, sourceReports = []) {
   const answersByQuestion = new Map();
   sourceReports.forEach((report) => {
@@ -1580,11 +1588,15 @@ function valueForReport2Column(answer, column) {
   const type = normalizedQuestionType(answer.type);
   const value = answer.answer;
   if (["Chọn một đáp án", "Đánh giá"].includes(type)) {
-    return normalizedText(String(value || "").split(" - ")[0]) === normalizedText(column.optionText) ? 1 : 0;
+    const selected = normalizedText(String(value || "").split(" - ")[0]) === normalizedText(column.optionText);
+    if (!selected) return 0;
+    return isOtherOption(column.optionText) ? selectedOtherExportValue(value) : 1;
   }
   if (type === "Chọn nhiều đáp án") {
     const values = Array.isArray(value) ? value : [];
-    return values.some((item) => normalizedText(String(item).split(" - ")[0]) === normalizedText(column.optionText)) ? 1 : 0;
+    const selectedValue = values.find((item) => normalizedText(String(item).split(" - ")[0]) === normalizedText(column.optionText));
+    if (!selectedValue) return 0;
+    return isOtherOption(column.optionText) ? selectedOtherExportValue(selectedValue) : 1;
   }
   if (type === TOP_N_TYPE) {
     const values = Array.isArray(value) ? value : [];
